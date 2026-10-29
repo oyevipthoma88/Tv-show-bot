@@ -22,6 +22,46 @@ _client = None
 _collection = None
 _save_lock = asyncio.Lock()
 MOVIE_CHUNK_SIZE = 5000
+# Atlas free tier = 512 MB. Big log tables are capped before saving and movie
+# chunks are zlib-compressed (~6-10x smaller), so the quota never fills again.
+STATE_TABLE_CAPS = {"audit_logs": 3000, "history": 8000, "stats": 5000}
+
+
+def _pack_rows(rows: list) -> bytes:
+    import json, zlib
+    return zlib.compress(json.dumps(rows, default=str, separators=(",", ":")).encode(), 6)
+
+
+def _unpack_chunk(chunk: dict) -> list:
+    if chunk.get("z") is not None:
+        import json, zlib
+        return json.loads(zlib.decompress(bytes(chunk["z"])).decode())
+    return chunk.get("rows", [])
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "space quota" in text or "over your space" in text or getattr(exc, "code", None) == 8000
+
+
+async def free_space(collection=None) -> None:
+    """Emergency cleanup when Atlas blocks writes: deletes are still allowed."""
+    try:
+        if collection is None:
+            collection = await _collection_or_none()
+        if collection is None:
+            return
+        await purge_orphan_chunks(collection)
+        # Legacy/backup docs from older versions.
+        res = await collection.delete_many({"_id": {"$regex": "^(backup|state_backup|snapshot)"}})
+        if res.deleted_count:
+            logging.info("Mongo freed %d legacy backup docs", res.deleted_count)
+        try:
+            await collection.database.command({"compact": collection.name})
+        except Exception:
+            pass
+    except Exception as exc:
+        logging.warning("Mongo free_space failed: %s", exc)
 
 
 async def _collection_or_none():
@@ -103,7 +143,7 @@ async def restore_movie_catalog():
                 chunks = await collection.find({"_id": {"$in": ids}}).to_list(length=len(ids))
                 by_id = {chunk["_id"]: chunk for chunk in chunks}
                 for chunk_id in ids:
-                    rows = by_id.get(chunk_id, {}).get("rows", [])
+                    rows = _unpack_chunk(by_id.get(chunk_id, {}))
                     if rows:
                         await db.import_state({"version": 3, "tables": {"movies": rows}})
                         restored_any = True
@@ -125,8 +165,10 @@ async def restore_movie_catalog():
         return False
 
 
-async def save_movie_catalog():
-    """Save movie catalog to MongoDB in batches to avoid OOM on large catalogs."""
+async def save_movie_catalog(_retry: bool = True):
+    """Save movie catalog to MongoDB in compressed batches (low RAM, low disk)."""
+    collection = None
+    generation = None
     try:
         collection = await _collection_or_none()
         if collection is None:
@@ -134,8 +176,6 @@ async def save_movie_catalog():
         now = datetime.now(timezone.utc)
         generation = now.strftime("%Y%m%dT%H%M%S%f")
         previous = await collection.find_one({"_id": "movies"}, {"generation": 1, "chunk_count": 1})
-        # Free space first: drop orphan chunks left by failed/timed-out saves.
-        # These piled up and filled the 512 MB Atlas quota (writes blocked).
         await purge_orphan_chunks(collection, previous)
         chunk_count = 0
         row_count = 0
@@ -147,8 +187,8 @@ async def save_movie_catalog():
             await asyncio.wait_for(
                 collection.replace_one(
                     {"_id": f"movies:{generation}:{chunk_count}"},
-                    {"_id": f"movies:{generation}:{chunk_count}", "version": 3,
-                     "generation": generation, "updated_at": now, "rows": chunk},
+                    {"_id": f"movies:{generation}:{chunk_count}", "version": 4,
+                     "generation": generation, "updated_at": now, "z": _pack_rows(chunk), "n": len(chunk)},
                     upsert=True,
                 ),
                 timeout=30.0,
@@ -156,10 +196,9 @@ async def save_movie_catalog():
             chunk_count += 1
             row_count += len(chunk)
             after_msg_id = int(chunk[-1]["msg_id"])
-        # Publish the manifest last, so restore never observes a partially written generation.
         await collection.replace_one(
             {"_id": "movies"},
-            {"_id": "movies", "version": 3, "updated_at": now, "count": row_count,
+            {"_id": "movies", "version": 4, "updated_at": now, "count": row_count,
              "chunked": True, "generation": generation, "chunk_count": chunk_count},
             upsert=True,
         )
@@ -171,15 +210,26 @@ async def save_movie_catalog():
                 for i in range(old_chunk_count)
             ]
             await collection.delete_many({"_id": {"$in": old_ids}})
-        logging.info(f"Mongo saved movie catalog: {row_count} movies in {chunk_count} chunks")
+        logging.info(f"Mongo saved movie catalog: {row_count} movies in {chunk_count} compressed chunks")
         return True
     except asyncio.TimeoutError:
         logging.warning("Mongo movie catalog save timeout")
-        await _drop_generation_safe(locals().get("collection"), locals().get("generation"))
+        await _drop_generation_safe(collection, generation)
         return False
     except Exception as e:
+        await _drop_generation_safe(collection, generation)
+        if _retry and _is_quota_error(e) and collection is not None:
+            # Quota full: the old (uncompressed) generation is what fills the disk.
+            # The catalog is still safe in local SQLite and in MAIN_DATA itself, so
+            # drop the old generation and write the compressed one in its place.
+            logging.warning("Mongo quota full — dropping old catalog and rewriting compressed")
+            try:
+                await collection.delete_many({"_id": {"$regex": "^movies"}})
+                await free_space(collection)
+            except Exception as exc:
+                logging.warning("Mongo quota recovery failed: %s", exc)
+            return await save_movie_catalog(_retry=False)
         logging.warning(f"Mongo movie catalog save error: {type(e).__name__}: {str(e)[:200]}")
-        await _drop_generation_safe(locals().get("collection"), locals().get("generation"))
         return False
 
 
@@ -278,20 +328,32 @@ async def save_non_movie_state():
                 state = await db.export_tables(NON_MOVIE_TABLES)
                 final_tables = {name: state["tables"].get(name, []) for name in NON_MOVIE_TABLES}
             
-            await asyncio.wait_for(
-                collection.replace_one(
-                    {"_id": "state"},
-                    {"_id": "state", "version": 2, "updated_at": datetime.now(timezone.utc), "tables": final_tables},
-                    upsert=True,
-                ),
-                timeout=30.0
-            )
-            return True
+            for table, cap in STATE_TABLE_CAPS.items():
+                rows = final_tables.get(table) or []
+                if len(rows) > cap:
+                    final_tables[table] = rows[-cap:]
+            doc = {"_id": "state", "version": 2, "updated_at": datetime.now(timezone.utc), "tables": final_tables}
+            try:
+                await asyncio.wait_for(collection.replace_one({"_id": "state"}, doc, upsert=True), timeout=30.0)
+                return True
+            except Exception as exc:
+                if not _is_quota_error(exc):
+                    raise
+                logging.warning("Mongo quota full on state save — freeing space and retrying")
+                await free_space(collection)
+                await collection.delete_many({"_id": {"$regex": "^movies"}})  # catalog re-saves compressed
+                await asyncio.wait_for(collection.replace_one({"_id": "state"}, doc, upsert=True), timeout=30.0)
+                try:
+                    from snapshot import request_catalog_save
+                    await request_catalog_save(delay=5)
+                except Exception:
+                    pass
+                return True
     except asyncio.TimeoutError:
         logging.warning("Mongo save timeout")
         return False
     except Exception as e:
-        logging.warning(f"Mongo save error: {type(e).__name__}")
+        logging.warning(f"Mongo save error: {type(e).__name__}: {str(e)[:200]}")
         return False
 
 
@@ -306,4 +368,4 @@ async def close_mongo():
     _collection = None
 
 
-__all__ = ["purge_orphan_chunks", "PERSISTED_TABLES", "NON_MOVIE_TABLES", "MOVIE_TABLES", "restore_non_movie_state", "save_non_movie_state", "restore_movie_catalog", "save_movie_catalog", "close_mongo"]
+__all__ = ["free_space", "purge_orphan_chunks", "PERSISTED_TABLES", "NON_MOVIE_TABLES", "MOVIE_TABLES", "restore_non_movie_state", "save_non_movie_state", "restore_movie_catalog", "save_movie_catalog", "close_mongo"]

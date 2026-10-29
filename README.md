@@ -44,6 +44,11 @@ Telegram TV show bot — non-admin channel se **live mirror**, har naya episode 
 
 ## 🆕 Live Mirror (non-admin channels)
 
+- **Multiple joiner accounts**: Owner Panel → 🔐 Login Account → **➕ Add Joiner Account**. Saare accounts parallel me sources watch karte hain; jo pehle naya upload dekhe wahi MAIN_DATA me bhejta hai (duplicate kabhi nahi). Joiner account ko MAIN_DATA admin hone ki zarurat nahi — main account upload kar deta hai
+- Search me kuch na mile to **har logged-in account ke joined channels** me ek saath global search hoti hai, aur file seedha user ko milti hai (link nahi)
+- Start pic MAIN_DATA me `#START_PIC` ke saath pin hoti hai — reboot ke baad bhi wapas aa jati hai
+- MongoDB catalog ab compressed save hota hai; 512 MB quota full hone par bot khud jagah khali karke dobara save karta hai
+
 - Owner Panel → **🔐 Login Account** → API ID/HASH (my.telegram.org) → phone → OTP (spaces ke saath, jaise `1 2 3 4 5`) → 2FA password (agar hai)
 - Session MongoDB me save hota hai, restart par auto-login
 - Login wala account source channel ka member ho aur **MAIN_DATA me admin** (post permission)

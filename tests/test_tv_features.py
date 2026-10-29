@@ -123,8 +123,14 @@ class TvCatalogTests(unittest.IsolatedAsyncioTestCase):
 class MenuTests(unittest.TestCase):
     def test_user_menu_has_tv_buttons(self):
         data = [b.callback_data for row in main_menu(False).inline_keyboard for b in row]
-        for needed in ("get_show", "latest:0", "myshows", "trending"):
+        for needed in ("get_show", "latest:0", "myshows", "more"):
             self.assertIn(needed, data)
+        more = [b.callback_data for row in keyboards.more_menu().inline_keyboard for b in row]
+        self.assertIn("trending", more)
+
+    def test_home_menu_is_compact(self):
+        buttons = [b for row in main_menu(False).inline_keyboard for b in row]
+        self.assertLessEqual(len(buttons), 5)
 
     def test_owner_panel_login_on_top(self):
         first_row = [b.callback_data for b in owner_panel_kb().inline_keyboard[0]]

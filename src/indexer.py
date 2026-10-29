@@ -577,7 +577,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
             try:
                 async for message in client.iter_messages(
                     entity, limit=None, wait_time=0,
-                    max_id=cursor_max or None,
+                    max_id=cursor_max or 0,
                 ):
                     last_id = int(getattr(message, "id", 0) or 0)
                     total += 1
@@ -737,7 +737,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
                 try:
                     async for message in client.iter_messages(
                         entity, limit=None, wait_time=0,
-                        max_id=cursor_max or None,
+                        max_id=cursor_max or 0,
                     ):
                         last_id = int(getattr(message, "id", 0) or 0)
                         total += 1

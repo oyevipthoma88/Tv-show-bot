@@ -26,7 +26,9 @@ class Login(StatesGroup):
 
 def _login_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [button("🔑 Login New Account", callback_data="lg:start", style="success")],
+        [button("🔑 Login Main Account", callback_data="lg:start", style="success")],
+        [button("➕ Add Joiner Account", callback_data="lg:extra", style="primary"),
+         button("👥 Accounts", callback_data="lg:accounts")],
         [button("🔄 Restart Live Mirror", callback_data="lg:restart"),
          button("🚪 Logout", callback_data="lg:logout", style="danger")],
         [button("⚙️ Change API ID/HASH", callback_data="lg:api")],
@@ -75,8 +77,48 @@ async def login_start(cb: CallbackQuery, state: FSMContext):
             "Step 1/3: <b>API ID aur API HASH</b> bhejo (my.telegram.org → API development tools):\n"
             "<code>1234567 abcdef0123456789abcdef0123456789</code>", reply_markup=_cancel_kb())
     await state.set_state(Login.phone)
+    await state.update_data(extra=False)
     await cb.message.answer("📱 Phone number country code ke saath bhejo:\n<code>+919876543210</code>",
                             reply_markup=_cancel_kb())
+
+
+@router.callback_query(F.data == "lg:extra")
+async def login_extra(cb: CallbackQuery, state: FSMContext):
+    """Extra accounts only need to JOIN source channels — the main account posts."""
+    if not await _owner(cb):
+        return
+    if not userbot.has_api() or not __import__("config").TG_SESSION:
+        return await cb.message.answer("<blockquote>Pehle <b>Main Account</b> login karo.</blockquote>",
+                                       reply_markup=_login_kb())
+    await state.set_state(Login.phone)
+    await state.update_data(extra=True)
+    await cb.message.answer(
+        "➕ <b>Joiner Account</b>\n<blockquote>Ye account sirf source channels join rakhega. "
+        "Naya upload jo bhi account pehle dekhe, wahi turant MAIN_DATA me bhejta hai.</blockquote>\n"
+        "📱 Phone number bhejo: <code>+919876543210</code>", reply_markup=_cancel_kb())
+
+
+@router.callback_query(F.data == "lg:accounts")
+async def login_accounts(cb: CallbackQuery):
+    if not await _owner(cb):
+        return
+    sessions = await userbot._extra_sessions()
+    rows = [[button(f"🗑 Remove joiner #{i + 1}", callback_data=f"lg:del:{i}", style="danger")]
+            for i in range(len(sessions))]
+    rows.append([button("⬅️ Back", callback_data="op:login")])
+    await cb.message.answer(
+        f"👥 <b>Accounts</b>\n<blockquote>{await userbot.status_text()}</blockquote>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("lg:del:"))
+async def login_del(cb: CallbackQuery, bot: Bot):
+    if not await _owner(cb):
+        return
+    ok = await userbot.remove_extra_session(int(cb.data.split(":")[2]))
+    await userbot.stop_live()
+    await userbot.start_live(bot)
+    await cb.message.answer("✅ Removed." if ok else "❌ Not found.", reply_markup=_login_kb())
 
 
 @router.callback_query(F.data == "lg:api")
@@ -108,7 +150,8 @@ async def got_phone(message: Message, state: FSMContext):
     if len(phone) < 8:
         return await message.answer("❌ Sahi phone number bhejo, jaise <code>+919876543210</code>")
     try:
-        await userbot.start_login(message.from_user.id, phone)
+        extra = bool((await state.get_data()).get("extra"))
+        await userbot.start_login(message.from_user.id, phone, extra=extra)
     except Exception as exc:
         await state.clear()
         return await message.answer(f"❌ OTP nahi gaya: <code>{escape(str(exc))}</code>", reply_markup=_login_kb())

@@ -7,7 +7,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
 BUTTON_STYLE = os.getenv("BUTTON_STYLE", "1")
-BUTTON_ICON_CUSTOM_EMOJI_ID = os.getenv("BUTTON_ICON_CUSTOM_EMOJI_ID", "5443038326535759644")
+# Custom-emoji icons need the bot owner to have Premium/Fragment username; a wrong id
+# makes Telegram reject the WHOLE message, so it is opt-in only.
+BUTTON_ICON_CUSTOM_EMOJI_ID = os.getenv("BUTTON_ICON_CUSTOM_EMOJI_ID", "")
 DEFAULT_BUTTON_STYLE = os.getenv("DEFAULT_BUTTON_STYLE", "primary")
 
 _SUPPORTED_FIELDS = getattr(InlineKeyboardButton, "model_fields", {}) or {}
@@ -39,29 +41,39 @@ def force_join_kb(channels: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 def main_menu(is_owner: bool, is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Compact home: 3 rows. Everything else lives under ⚙️ More."""
     kb = InlineKeyboardBuilder()
-    kb.row(button("📺 Search TV Show", callback_data="get_show", style="success"))
+    kb.row(button("🔎 Search Show", callback_data="get_show", style="success"))
     kb.row(
-        button("🆕 Latest Uploads", callback_data="latest:0"),
-        button("🔥 Trending", callback_data="trending"),
-    )
-    kb.row(
-        button("🔔 My Shows", callback_data="myshows"),
-        button("🕘 History", callback_data="history"),
+        button("🆕 Latest", callback_data="latest:0", style="primary"),
+        button("🔔 My Shows", callback_data="myshows", style="primary"),
     )
     kb.row(
         button("💎 Premium", callback_data="plans", style="success"),
-        button("🎟 Coupon", callback_data="coupon"),
+        button("⚙️ More", callback_data="more", style="primary"),
     )
-    kb.row(
-        button("🎁 Refer & Earn", callback_data="refer"),
-        button("🎥 Watch Online", callback_data="online_player"),
-    )
-    kb.row(button("📘 How to Use", callback_data="tutorial"))
     if is_owner:
         kb.row(button("🛠 Owner Panel", callback_data="op:home", style="danger"))
     elif is_admin:
-        kb.row(button("➕ Add Video", callback_data="admin:addvideo"))
+        kb.row(button("➕ Add Video", callback_data="admin:addvideo", style="danger"))
+    return kb.as_markup()
+
+
+def more_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        button("🔥 Trending", callback_data="trending", style="primary"),
+        button("🕘 History", callback_data="history", style="primary"),
+    )
+    kb.row(
+        button("🎁 Refer & Earn", callback_data="refer", style="success"),
+        button("🎟 Coupon", callback_data="coupon", style="success"),
+    )
+    kb.row(
+        button("🎥 Watch Online", callback_data="online_player", style="primary"),
+        button("📘 Help", callback_data="tutorial", style="primary"),
+    )
+    kb.row(button("🏠 Home", callback_data="home", style="danger"))
     return kb.as_markup()
 
 
@@ -127,7 +139,7 @@ def results_kb(movies: list, query: str, extra_rows: list | None = None) -> Inli
         kb.row(button(episode_button_label(m), callback_data=f"send:{m['msg_id']}", style="success"))
     for row in extra_rows or []:
         kb.row(*row)
-    kb.row(button("🏠 Home", callback_data="home"))
+    kb.row(button("🏠 Home", callback_data="home", style="danger"))
     return kb.as_markup()
 
 

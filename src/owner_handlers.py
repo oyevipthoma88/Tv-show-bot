@@ -119,16 +119,22 @@ async def op_startpic(cb: CallbackQuery, state: FSMContext):
 async def set_startpic(message: Message, bot: Bot, state: FSMContext):
     value = (message.text or "").strip()
     if message.photo:
-        try:
-            saved = await bot.forward_message(STORAGE_CHANNEL, message.chat.id, message.message_id, disable_notification=True)
-            value = saved.photo[-1].file_id
-        except Exception as exc:
-            return await message.answer(f"❌ Start pic storage me save nahi hui: <code>{str(exc)[:160]}</code>")
+        value = message.photo[-1].file_id
     if not value:
         return await message.answer("GitHub/raw image URL ya photo bhejo.")
-    await db.set("start_pic", value)
+    from start_pic import save_start_pic
+    try:
+        await save_start_pic(bot, value)
+    except Exception as exc:
+        return await message.answer(f"❌ Start pic MAIN_DATA me save nahi hui: <code>{str(exc)[:160]}</code>")
     await state.clear()
-    await message.answer("✅ Start pic durable storage me save ho gayi.", reply_markup=owner_panel_kb())
+    try:
+        from snapshot import request_snapshot
+        await request_snapshot(bot, delay=2)
+    except Exception:
+        pass
+    await message.answer("<blockquote>✅ Start pic MAIN_DATA me pin ho gayi — reboot ke baad bhi rahegi.</blockquote>",
+                         reply_markup=owner_panel_kb())
 
 
 @router.callback_query(F.data == "op:qr")

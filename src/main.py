@@ -117,6 +117,11 @@ async def main() -> None:
 
     await notify("♻️ <b>Bot restart started</b>\nRestoring users, settings, and existing MAIN_DATA movie catalog from MongoDB.")
     removed_legacy = await remove_legacy_telegram_snapshots(bot)
+    try:
+        from start_pic import restore_start_pic
+        await restore_start_pic(bot)
+    except Exception as exc:
+        logging.warning("Start pic restore failed: %s", exc)
     if removed_legacy:
         logging.info("Removed %s legacy Telegram state file(s)", removed_legacy)
     restored = False

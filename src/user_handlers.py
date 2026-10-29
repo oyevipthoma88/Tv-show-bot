@@ -29,7 +29,7 @@ from log_helper import (
     log_group_search, log_movie_request,
 )
 from db import db
-from keyboards import (admin_panel_kb, approve_kb, browse_kb, button, force_join_kb, main_menu, movie_link_kb,
+from keyboards import (more_menu, admin_panel_kb, approve_kb, browse_kb, button, force_join_kb, main_menu,
                        paid_kb, plans_kb, plans_text, plan_label, results_kb)
 from indexer import classify, index_message
 from snapshot import request_snapshot
@@ -228,19 +228,14 @@ async def send_home(target: Optional[Message], bot: Bot, user_id: int) -> None:
         bot_name = escape(bot_profile["first_name"] or bot_profile["username"] or "TV Show Bot")
     except Exception:
         bot_name = "TV Show Bot"
-    fresh = await db.latest_show_titles(3)
-    fresh_line = f"🔥 <b>Abhi aaye:</b> {escape(', '.join(fresh))}\n\n" if fresh else ""
+    fresh = await db.latest_show_titles(2)
+    fresh_line = f"\n🔥 <i>{escape(', '.join(fresh))[:120]}</i>" if fresh else ""
+    first = escape((getattr(target, "chat", None) and target.chat.first_name) or "")
+    hello = f"👋 Hi {first}!" if first and target and target.chat.type == "private" else "👋 Hi!"
     text = (
-        f"📺 <b>Welcome to {bot_name}</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"<b>{status}</b>\n\n"
-        "🔎 Kisi bhi <b>TV show</b> ka naam bhejo — spelling galat bhi chalega\n"
-        "🆕 Har naya episode upload hote hi yahan milta hai\n"
-        "📅 Sabse naya episode hamesha <b>sabse upar</b>, date ke saath\n"
-        "🔔 Show follow karo — naya episode aate hi alert\n\n"
-        f"{fresh_line}"
-        "💎 <b>Premium:</b> Unlimited episodes, koi daily limit nahi\n\n"
-        "👇 Show ka naam bhejo ya button chuno"
+        f"<b>{hello} Welcome to {bot_name}</b>\n"
+        f"<blockquote>📺 Show ka naam bhejo — episode <b>seedha yahin</b> milega.\n"
+        f"{status}{fresh_line}</blockquote>"
     )
     pic = await db.get("start_pic", "")
     kb = main_menu(user_id in OWNER_IDS, user_id in await db.admins())
@@ -319,6 +314,15 @@ async def verify(cb: CallbackQuery, bot: Bot):
     except Exception:
         pass
     await send_home(None, bot, cb.from_user.id)
+
+
+@router.callback_query(F.data == "more")
+async def more(cb: CallbackQuery, bot: Bot):
+    await cb.answer()
+    try:
+        await cb.message.edit_reply_markup(reply_markup=more_menu())
+    except Exception:
+        await cb.message.answer("⚙️ <b>More</b>", reply_markup=more_menu())
 
 
 @router.callback_query(F.data == "home")
@@ -596,7 +600,7 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
                 _ch_id = _r.get('channel_id', STORAGE_CHANNEL)
                 _btns.append([button(
                     f"📺 {title}",
-                    callback_data=f"directdl:{_ch_id}:{_r.get('msg_id')}",
+                    callback_data=f"directdl:{_ch_id}:{_r.get('msg_id')}:{int(_r.get('account', 0) or 0)}",
                     style="success",
                 )])
             _support_url = await db.get("support_url", "") or SUPPORT_URL
@@ -654,10 +658,8 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
         following = await db.is_following(message.from_user.id, top_key)
         extra = follow_rows(top, following, total_eps, len(results))
     await message.answer(
-        f"🔎 <b>{escape(query)}</b> — {len(results)} result(s)\n"
-        "━━━━━━━━━━━━━━\n"
-        "📅 Sabse naya episode sabse upar hai\n"
-        "👇 Tap karo, file turant aayegi",
+        f"<blockquote>🔎 <b>{escape(query)}</b> • {len(results)} result(s)</blockquote>\n"
+        "<blockquote>📅 Naya episode sabse upar • 👇 Tap karo, file seedha aayegi</blockquote>",
         reply_markup=results_kb(results, query, extra_rows=extra),
     )
 
@@ -694,7 +696,6 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
         storage_info = {"id": storage_chat["id"], "username": storage_chat["username"]}
     except Exception:
         storage_info = {"id": STORAGE_CHANNEL, "username": ""}
-    link = post_link(storage_info, delivery_msg_id)
     title = movie["title"] if movie else "Episode"
     try:
         caption = await format_movie_caption(bot, movie)
@@ -727,7 +728,7 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
                 caption=caption[:1024],
                 parse_mode="HTML",
             ),
-            timeout=8,
+            timeout=20,
         )
         copied_id = getattr(copied, "message_id", 0)
         delivered_message_id = copied_id
@@ -776,22 +777,27 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
         except Exception as e:
             err = str(e)
 
-    if not mode and link:
-        mode = "link-fallback"
-        fallback_message = await cb.message.answer(
-            f"{caption}\n\n👇 File seedha channel post se le lo.",
-            reply_markup=movie_link_kb(link),
-        )
-        delivered_message_id = getattr(fallback_message, "message_id", 0)
+    # Never send a channel link — always deliver the file itself.
+    if not mode:
+        for attempt_name, call in (
+            ("copy/plain", lambda: bot.copy_message(cb.from_user.id, STORAGE_CHANNEL, delivery_msg_id)),
+            ("forward", lambda: bot.forward_message(cb.from_user.id, STORAGE_CHANNEL, delivery_msg_id)),
+        ):
+            try:
+                sent = await asyncio.wait_for(call(), timeout=20)
+                delivered_message_id = getattr(sent, "message_id", 0)
+                mode = attempt_name
+                err = ""
+                break
+            except Exception as e:
+                err = str(e)
     if not mode:
         await refund_quota(cb.from_user.id)
         kind = classify(err)
         mode = f"failed({kind})"
         await cb.message.answer(
-            "⚠️ Episode deliver nahi ho payi.\n"
-            f"MAIN_DATA post: <code>{delivery_msg_id}</code>\n"
-            f"Reason: <code>{escape(err[:500] or 'Telegram delivery failed')}</code>\n"
-            "Owner ko LOG_CHANNEL error check karke bot ko MAIN_DATA me admin karna hoga."
+            "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
+            "aapka free count wapas kar diya gaya hai.</blockquote>"
         )
 
     if delivered_message_id and not mode.startswith("failed"):
@@ -835,7 +841,8 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
     Supports multi-channel: directdl:<channel_id>:<msg_id>"""
     parts = cb.data.split(":")
     try:
-        if len(parts) == 3:
+        account = int(parts[3]) if len(parts) >= 4 else 0
+        if len(parts) >= 3:
             channel_id = int(parts[1])
             msg_id = int(parts[2])
         else:
@@ -863,7 +870,7 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         if channel_id != int(_cfg.MAIN_DATA) and channel_id not in set(getattr(_cfg, "MAIN_CHANNELS", []) or []):
             # Found in a joined source channel: mirror into MAIN_DATA first, then deliver.
             import userbot
-            new_id = await userbot.import_to_main(channel_id, msg_id)
+            new_id = await userbot.import_to_main(channel_id, msg_id, account)
             if not new_id:
                 raise RuntimeError("source import failed")
             channel_id, msg_id = int(_cfg.MAIN_DATA), int(new_id)
@@ -877,6 +884,12 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
                 f"\n<blockquote>⚠️ <b>Security:</b> Ye episode {_expiry_label(delete_minutes)} me auto-delete hoga. "
                 "Episode milte hi save ya forward kar lo.</blockquote>"
             )
+        try:
+            _mv = await db.movie(msg_id)
+            if _mv:
+                caption = await format_movie_caption(bot, _mv)
+        except Exception:
+            pass
         copied = await asyncio.wait_for(
             bot.copy_message(
                 cb.from_user.id,
@@ -899,9 +912,8 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await refund_quota(cb.from_user.id)
         logging.exception("Direct download failed for %s: %s", msg_id, exc)
         await cb.message.answer(
-            "⚠️ Episode deliver nahi ho payi.\n"
-            f"Message ID: <code>{msg_id}</code>\n"
-            "Owner ko LOG_CHANNEL error check karna hoga."
+            "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
+            "aapka free count wapas kar diya gaya hai.</blockquote>"
         )
 
 

@@ -21,7 +21,10 @@ for _raw_owner in os.getenv("OWNER_IDS", "").split(","):
             _OWNER_IDS.add(int(_raw_owner.strip()))
     except ValueError:
         pass
-OWNER_IDS = frozenset(_OWNER_IDS)
+# Mutable on purpose: /addowner adds owners at runtime and every module that
+# did `from config import OWNER_IDS` shares this same set object.
+OWNER_IDS: set[int] = set(_OWNER_IDS)
+ENV_OWNER_IDS = frozenset(_OWNER_IDS)
 LOG_CHANNEL = _int("LOG_CHANNEL")
 # MAIN_DATA is the one canonical channel whose copies form the user catalog.
 MAIN_DATA = _int("MAIN_DATA", _int("STORAGE_CHANNEL", -1003463663979))

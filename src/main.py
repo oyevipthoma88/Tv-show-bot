@@ -56,6 +56,10 @@ async def main() -> None:
     if filled:
         logging.info("TV grouping filled for %s restored episodes", filled)
     await userbot.load_saved_credentials()
+    # Owners added with /addowner (stored in settings, backed up with state).
+    from config import OWNER_IDS as _owners
+    for _extra in await db.extra_owners():
+        _owners.add(_extra)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     legacy_migration_task = None
 
@@ -186,6 +190,36 @@ async def main() -> None:
                 logging.exception("Periodic state snapshot failed")
 
     snapshot_task = asyncio.create_task(periodic_snapshot(), name="periodic-snapshot")
+
+    async def limit_reminder_loop() -> None:
+        """Free limit khatam hone ke baad, reset par 'dobara dekho' reminder."""
+        import time as _t
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        while True:
+            try:
+                await asyncio.sleep(60)
+                for uid in await db.due_limit_reminders(int(_t.time())):
+                    await db.clear_limit_reminder(uid)
+                    try:
+                        await bot.send_message(
+                            uid,
+                            "<blockquote>⏰ <b>Aapki free limit wapas aa gayi!</b></blockquote>\n"
+                            "Aaj ke naye episodes upload ho chuke hain — dobara TV shows dekho 📺\n"
+                            "Bas show ka naam bhejo.",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🆕 Latest Uploads", callback_data="latest:0")],
+                                [InlineKeyboardButton(text="🔔 My Shows", callback_data="myshows")],
+                            ]),
+                        )
+                    except Exception as exc:
+                        logging.info("Limit reminder skipped for %s: %s", uid, exc)
+                    await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Limit reminder loop error")
+
+    reminder_task = asyncio.create_task(limit_reminder_loop(), name="limit-reminders")
     try:
         await bot.set_my_commands(
             [
@@ -193,6 +227,7 @@ async def main() -> None:
                 BotCommand(command="show", description="Search a TV show"),
                 BotCommand(command="latest", description="Latest uploaded episodes"),
                 BotCommand(command="myshows", description="Followed shows & alerts"),
+                BotCommand(command="addowner", description="Owner: add another owner"),
                 BotCommand(command="request", description="Request a show"),
                 BotCommand(command="stats", description="Your usage stats"),
                 BotCommand(command="myplan", description="Check premium status"),
@@ -239,6 +274,7 @@ async def main() -> None:
     finally:
         # Heroku SIGKILLs 30s after SIGTERM (Error R12). Cancel every long
         # running task first, then do one small save.
+        reminder_task.cancel()
         if scan_task is not None and not scan_task.done():
             scan_task.cancel()
             try:

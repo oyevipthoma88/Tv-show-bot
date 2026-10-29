@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS follows (
     UNIQUE (user_id, show_key)
 );
 CREATE TABLE IF NOT EXISTS episode_alerts (msg_id INTEGER PRIMARY KEY, at INTEGER);
+CREATE TABLE IF NOT EXISTS limit_reminders (user_id INTEGER PRIMARY KEY, remind_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_follows_show ON follows (show_key);
 CREATE INDEX IF NOT EXISTS idx_history_msg_id_at ON history (msg_id, at DESC);
 CREATE INDEX IF NOT EXISTS idx_delivery_expiry_delete_at ON delivery_expiry (delete_at);
@@ -853,6 +854,89 @@ class DB:
         except Exception:
             await self.conn.rollback()
             return None
+
+    # ---------- extra owners (/addowner) ----------
+    async def extra_owners(self) -> list[int]:
+        raw = await self.get("extra_owners", "")
+        out = []
+        for part in raw.split(","):
+            try:
+                out.append(int(part.strip()))
+            except ValueError:
+                pass
+        return out
+
+    async def add_extra_owner(self, user_id: int) -> None:
+        owners = await self.extra_owners()
+        if user_id not in owners:
+            owners.append(user_id)
+        await self.set("extra_owners", ",".join(str(o) for o in owners))
+
+    async def remove_extra_owner(self, user_id: int) -> None:
+        owners = [o for o in await self.extra_owners() if o != user_id]
+        await self.set("extra_owners", ",".join(str(o) for o in owners))
+
+    # ---------- limit-over reminders ----------
+    async def set_limit_reminder(self, user_id: int, remind_at: int) -> None:
+        await self.conn.execute(
+            "INSERT INTO limit_reminders (user_id, remind_at) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET remind_at=excluded.remind_at",
+            (user_id, int(remind_at)),
+        )
+        await self.conn.commit()
+
+    async def due_limit_reminders(self, now: int, limit: int = 200) -> list[int]:
+        cur = await self.conn.execute(
+            "SELECT user_id FROM limit_reminders WHERE remind_at <= ? LIMIT ?", (int(now), limit)
+        )
+        return [int(r["user_id"]) for r in await cur.fetchall()]
+
+    async def clear_limit_reminder(self, user_id: int) -> None:
+        await self.conn.execute("DELETE FROM limit_reminders WHERE user_id=?", (user_id,))
+        await self.conn.commit()
+
+    # ---------- spelling + stale rows ----------
+    async def distinct_show_titles(self, limit: int = 5000) -> list[str]:
+        """One title per show (newest first) — the vocabulary for spelling fixes."""
+        cur = await self.conn.execute(
+            """SELECT title FROM movies WHERE storage_msg_id > 0 AND title IS NOT NULL
+               GROUP BY COALESCE(NULLIF(show_key, ''), LOWER(title))
+               ORDER BY MAX(added_at) DESC LIMIT ?""",
+            (limit,),
+        )
+        return [str(r["title"]) for r in await cur.fetchall() if r["title"]]
+
+    async def mark_stale(self, msg_id: int) -> None:
+        """MAIN_DATA post is gone: hide the row so it is never offered again."""
+        await self.conn.execute("UPDATE movies SET storage_msg_id=0 WHERE msg_id=? OR storage_msg_id=?",
+                                (msg_id, msg_id))
+        await self.conn.commit()
+
+    async def alternate_copy(self, movie, exclude: set[int]) -> Optional[object]:
+        """Another live MAIN_DATA post of the same file / same episode."""
+        keys = movie.keys()
+        file_id = movie["file_id"] if "file_id" in keys else ""
+        if file_id:
+            cur = await self.conn.execute(
+                "SELECT * FROM movies WHERE storage_msg_id > 0 AND file_id=? ORDER BY added_at DESC", (file_id,)
+            )
+            for row in await cur.fetchall():
+                if int(row["storage_msg_id"] or row["msg_id"]) not in exclude:
+                    return row
+        show = movie["show_key"] if "show_key" in keys else ""
+        ep = int(movie["episode"] or 0) if "episode" in keys else 0
+        air = (movie["air_date"] or "") if "air_date" in keys else ""
+        if show and (ep or air):
+            cur = await self.conn.execute(
+                """SELECT * FROM movies WHERE storage_msg_id > 0 AND show_key=?
+                   AND ((? > 0 AND episode=?) OR (? <> '' AND air_date=?))
+                   ORDER BY added_at DESC""",
+                (show, ep, ep, air, air),
+            )
+            for row in await cur.fetchall():
+                if int(row["storage_msg_id"] or row["msg_id"]) not in exclude:
+                    return row
+        return None
 
     async def admins(self) -> list[int]:
         cur = await self.conn.execute("SELECT user_id FROM admins")

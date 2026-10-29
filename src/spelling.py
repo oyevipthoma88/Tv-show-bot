@@ -1,5 +1,12 @@
-"""Lightweight spelling correction for movie name searches.
-Uses rapidfuzz for fuzzy matching against the known catalog titles."""
+"""Spelling correction for TV show / serial searches.
+
+Hindi serial names are typed in many romanised ways (Anupama / Anupamaa /
+Anupmaa, Yeh Rishta / Ye Rista, Kundali / Kundli Bhagya). Matching is done on a
+*phonetic key* (double letters collapsed, common transliteration swaps
+normalised, vowels softened) and only against the show-name part of each
+catalog title — the first few words — so long file captions like
+"Anupama Anupama'S Unexpected Shock Hs Dl Aac2 0 H 264" don't dilute the score.
+"""
 from __future__ import annotations
 
 import re
@@ -13,86 +20,128 @@ def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-# Common misspelling → correction map for Indian movie names
+# Common misspelling → correction map (normalised form → correct name)
 COMMON_FIXES = {
     "mirjapur": "mirzapur",
     "mirjapurr": "mirzapur",
     "mirzapurr": "mirzapur",
-    "hanumanansh": "hanumanansh",
     "hanuman ansh": "hanumanansh",
     "hanumanash": "hanumanansh",
-    "sooryavanshi": "sooryavanshi",
     "suryavanshi": "sooryavanshi",
     "suryavansh": "sooryavanshi",
-    "brahmastra": "brahmastra",
     "brahmashtra": "brahmastra",
     "brahmaastra": "brahmastra",
-    "ranjana": "ranjana",
     "ranjnaa": "ranjana",
     "krissh": "krrish",
     "krishh": "krrish",
     "krisshh": "krrish",
     "rajneeti": "raajneeti",
-    "raajneeti": "raajneeti",
-    "agneepath": "agneepath",
-    "agneepaath": "agneepath",
     "donnd": "don",
     "sholayy": "sholay",
     "sholaay": "sholay",
+    # TV serials
+    "anupma": "anupamaa",
+    "anupmaa": "anupamaa",
+    "anupamma": "anupamaa",
+    "ye rishta": "yeh rishta kya kehlata hai",
+    "yrkkh": "yeh rishta kya kehlata hai",
+    "yeh rista": "yeh rishta kya kehlata hai",
+    "kundli bhagya": "kundali bhagya",
+    "kundli bhagy": "kundali bhagya",
+    "kumkum bhagy": "kumkum bhagya",
+    "kumkum bagya": "kumkum bhagya",
+    "tmkoc": "taarak mehta ka ooltah chashmah",
+    "tarak mehta": "taarak mehta ka ooltah chashmah",
+    "taarak mehta": "taarak mehta ka ooltah chashmah",
+    "gum hai kisi ke pyar me": "ghum hai kisikey pyaar meiin",
+    "ghkkpm": "ghum hai kisikey pyaar meiin",
+    "bhagya laxmi": "bhagya lakshmi",
+    "bhagyalaxmi": "bhagya lakshmi",
+    "big boss": "bigg boss",
+    "bigboss": "bigg boss",
 }
+
+# Applied in order on the normalised string.
+_PHONETIC_SWAPS = (
+    ("ksh", "x"), ("kh", "k"), ("gh", "g"), ("bh", "b"), ("dh", "d"), ("th", "t"),
+    ("ph", "f"), ("sh", "s"), ("ch", "c"), ("jh", "j"), ("z", "j"), ("w", "v"),
+    ("q", "k"), ("ck", "k"), ("ee", "i"), ("oo", "u"), ("ou", "u"), ("y", "i"),
+)
+
+
+def phonetic(s: str) -> str:
+    """Spelling-insensitive key: 'Anupamaa' == 'anupama' == 'anupmaa'-ish."""
+    s = _normalize(s)
+    for a, b in _PHONETIC_SWAPS:
+        s = s.replace(a, b)
+    s = re.sub(r"(.)\1+", r"\1", s)          # collapse doubled letters
+    s = re.sub(r"\bh\b|h(?=\s|$)", "", s)      # trailing silent h (yeh -> ye)
+    s = re.sub(r"a(?=\s|$)", "", s)            # trailing 'a'/'aa' (anupamaa -> anupam)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _show_phrases(title: str, n_words: int) -> list[str]:
+    words = _normalize(title).split()
+    if not words:
+        return []
+    out = []
+    for n in {max(1, n_words - 1), n_words, n_words + 1}:
+        if n <= len(words):
+            out.append(" ".join(words[:n]))
+    return out
 
 
 def correct_spelling(query: str, catalog_titles: Optional[list[str]] = None) -> Optional[str]:
-    """Try to correct common spelling mistakes in movie names.
-
-    First checks a manual common-fixes map, then uses fuzzy matching
-    against known catalog titles to find the closest correct spelling.
-
-    Returns the corrected query, or None if no confident correction found.
-    """
-    q = (query or "").strip()
-    if not q or len(q) < 3:
+    """Return the corrected show name for a misspelled query, or None."""
+    q_norm = _normalize(query)
+    if not q_norm or len(q_norm) < 3:
         return None
-
-    q_norm = _normalize(q)
-    if not q_norm:
-        return None
-
-    # 1) Check common fixes map (exact normalized match)
     if q_norm in COMMON_FIXES:
         return COMMON_FIXES[q_norm]
+    if not catalog_titles:
+        return None
 
-    # 2) Fuzzy match against catalog titles if provided
-    if catalog_titles:
-        norm_titles = [(t, _normalize(t)) for t in catalog_titles if t]
-        choices = {i: nt for i, (_, nt) in enumerate(norm_titles) if nt}
-        if not choices:
-            return None
-        result = process.extractOne(
-            q_norm, choices, scorer=fuzz.WRatio, score_cutoff=80
-        )
-        if result:
-            idx, score, _ = result
-            if score >= 80:
-                original_title = norm_titles[idx][0]
-                return original_title
-
+    q_key = phonetic(q_norm)
+    n_words = len(q_norm.split())
+    best: tuple[float, str] = (0.0, "")
+    for title in catalog_titles:
+        for phrase in _show_phrases(title, n_words):
+            if phrase == q_norm:
+                return None  # already spelled correctly
+            p_key = phonetic(phrase)
+            if not p_key:
+                continue
+            score = fuzz.ratio(q_key, p_key) if p_key != q_key else 100.0
+            # tiny bonus for same first letter — users rarely get that wrong
+            if q_key[:1] == p_key[:1]:
+                score += 3
+            if score > best[0]:
+                best = (score, phrase)
+    cutoff = 80 if len(q_key) >= 5 else 90
+    if best[0] >= cutoff and best[1] != q_norm:
+        return best[1]
     return None
 
 
 def suggest_corrections(query: str, catalog_titles: Optional[list[str]] = None, limit: int = 3) -> list[str]:
-    """Return up to `limit` suggested corrections for a misspelled query."""
+    """Up to `limit` distinct show names that look like the query."""
     q_norm = _normalize(query)
     if not q_norm or not catalog_titles:
         return []
-    norm_titles = [(t, _normalize(t)) for t in catalog_titles if t]
-    choices = {i: nt for i, (_, nt) in enumerate(norm_titles) if nt}
-    if not choices:
+    q_key = phonetic(q_norm)
+    n_words = len(q_norm.split())
+    phrases = {}
+    for title in catalog_titles:
+        for phrase in _show_phrases(title, n_words):
+            phrases.setdefault(phonetic(phrase), phrase)
+    if not phrases:
         return []
-    results = process.extract(
-        q_norm, choices, scorer=fuzz.WRatio, score_cutoff=70, limit=limit
-    )
-    suggestions = []
-    for idx, score, _ in results:
-        suggestions.append(norm_titles[idx][0])
-    return suggestions
+    results = process.extract(q_key, list(phrases.keys()), scorer=fuzz.ratio, score_cutoff=70, limit=limit * 3)
+    out: list[str] = []
+    for key, _score, _ in results:
+        name = phrases[key]
+        if name not in out and name != q_norm:
+            out.append(name)
+        if len(out) >= limit:
+            break
+    return out

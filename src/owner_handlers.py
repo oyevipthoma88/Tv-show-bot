@@ -1272,6 +1272,56 @@ async def set_support_url(message: Message, bot: Bot):
         await message.answer(f"✅ Support URL set ho gaya:\n<code>{url}</code>\n\nAb jab movie nahi milegi, users ko ye button dikhega.")
 
 
+@router.message(Command("addowner"))
+async def add_owner_cmd(message: Message, bot: Bot):
+    """/addowner <user_id> — give full owner powers (saved, survives restart)."""
+    if not await is_owner(message.from_user.id):
+        return
+    await log_command(bot, message.from_user, "addowner")
+    parts = (message.text or "").split(maxsplit=1)
+    target = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user.id
+    elif len(parts) >= 2:
+        try:
+            target = int(parts[1].strip())
+        except ValueError:
+            target = None
+    if not target:
+        return await message.answer(
+            "Usage: <code>/addowner user_id</code> (ya kisi message ko reply karke /addowner)\n"
+            "Hatane ke liye: <code>/delowner user_id</code>"
+        )
+    if target in OWNER_IDS:
+        return await message.answer(f"ℹ️ <code>{target}</code> pehle se owner hai.")
+    await db.add_extra_owner(target)
+    OWNER_IDS.add(target)
+    await log_owner_action(bot, message.from_user.id, "add_owner", f"User {target} owner bana")
+    await message.answer(f"✅ <code>{target}</code> ab owner hai. /owner se panel khul jayega.")
+    try:
+        await bot.send_message(target, "👑 Aapko is bot ka <b>Owner</b> bana diya gaya hai. /start dabao.")
+    except Exception:
+        pass
+
+
+@router.message(Command("delowner"))
+async def del_owner_cmd(message: Message, bot: Bot):
+    if not await is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    try:
+        target = int(parts[1].strip())
+    except (IndexError, ValueError):
+        return await message.answer("Usage: <code>/delowner user_id</code>")
+    from config import ENV_OWNER_IDS
+    if target in ENV_OWNER_IDS:
+        return await message.answer("❌ Main owner (OWNER_ID env) ko hataya nahi ja sakta.")
+    await db.remove_extra_owner(target)
+    OWNER_IDS.discard(target)
+    await log_owner_action(bot, message.from_user.id, "del_owner", f"User {target} owner se hataya")
+    await message.answer(f"✅ <code>{target}</code> ab owner nahi hai.")
+
+
 @router.message(Command("ban"))
 async def ban_user_cmd(message: Message, bot: Bot):
     if not await is_owner(message.from_user.id):

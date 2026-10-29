@@ -35,7 +35,7 @@ from indexer import classify, index_message
 from snapshot import request_snapshot
 from movie_catalog import catalog_label
 from channel_search import search_channel
-from spelling import correct_spelling
+from spelling import correct_spelling, suggest_corrections
 from utils import (get_movie_channel, apply_referral_rewards, check_quota,
                    human_left, is_first_calendar_day, is_premium, post_link, search_movies,
                    transcribe_voice, user_tag, reserve_quota, refund_quota)
@@ -57,6 +57,23 @@ class Flow(StatesGroup):
 
 async def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
+
+
+def _next_reset_ts() -> int:
+    """Free quota resets on the server's calendar day — remind 2 min after that."""
+    tomorrow = _dt.date.today() + _dt.timedelta(days=1)
+    return int(_dt.datetime.combine(tomorrow, _dt.time(0, 2)).timestamp())
+
+
+async def _limit_hit(user_id: int) -> None:
+    """User ran out of free episodes: queue a 'dobara dekho' reminder."""
+    try:
+        await db.set_limit_reminder(user_id, _next_reset_ts())
+    except Exception as exc:
+        logging.warning("Could not schedule limit reminder for %s: %s", user_id, exc)
+
+
+_LIMIT_REMINDER_NOTE = "\n\n⏰ Limit reset hote hi main aapko reminder bhej dunga — dobara TV shows dekhna!"
 
 
 _STORAGE_CHAT_CACHE: dict = {}
@@ -569,11 +586,24 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
     if not ok:
         await state.clear()
         await log_quota_exhausted(bot=effective_bot, user=message.from_user, limit=1)
-        await message.answer(why, reply_markup=plans_kb(await db.plans()))
+        await _limit_hit(message.from_user.id)
+        await message.answer(why + _LIMIT_REMINDER_NOTE, reply_markup=plans_kb(await db.plans()))
         return
     data = await state.get_data()
     content_type = data.get("content_type", "")
     results = await search_movies(query, content_type=content_type)
+    autocorrected = ""
+    if not results:
+        # Strong spelling fix: "anupma" / "kundli bhagy" -> real show name, then retry.
+        try:
+            vocab = await db.distinct_show_titles()
+            fixed = correct_spelling(query, vocab)
+            if fixed and fixed.lower() != query.lower():
+                results = await search_movies(fixed, content_type=content_type)
+                if results:
+                    autocorrected = fixed
+        except Exception as exc:
+            logging.warning("Spelling auto-correct failed for %r: %s", query, exc)
 
     if not results:
         try:
@@ -622,12 +652,15 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
             suggestion_markup = results_kb(suggestions, query)
         support_url = await db.get("support_url", "") or SUPPORT_URL
         
-        candidate_titles = await db.search_titles_for_spelling(query)
-        corrected = correct_spelling(query, candidate_titles)
+        candidate_titles = await db.distinct_show_titles()
+        corrected = correct_spelling(query, candidate_titles) or ""
+        guesses = suggest_corrections(query, candidate_titles, limit=3)
         spelling_msg = ""
-        if corrected and corrected.lower() != query.lower():
-            spelling_msg = f"\n\n💡 Kya aap <b>{escape(corrected)}</b> dhundh rahe the? Spelling check karke dobara try karo!"
+        if guesses:
+            spelling_msg = "\n\n💡 Kya aap inme se koi dhundh rahe the? Tap karo 👇"
         kb_rows = []
+        for g in guesses:
+            kb_rows.append([button(f"🔎 {g.title()}"[:56], callback_data=f"sq:{g[:50]}", style="primary")])
         if suggestion_markup:
             kb_rows.extend(suggestion_markup.inline_keyboard)
         if support_url:
@@ -657,8 +690,27 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
         total_eps = await db.show_episode_count(top_key)
         following = await db.is_following(message.from_user.id, top_key)
         extra = follow_rows(top, following, total_eps, len(results))
+    # Follow / Unfollow for every other distinct show in the results too.
+    seen_keys = {top_key} if top_key else set()
+    for row in results[1:]:
+        try:
+            key = row["show_key"] or ""
+        except (KeyError, IndexError):
+            key = ""
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        is_f = await db.is_following(message.from_user.id, key)
+        name = str(row["title"] or "Show").split("  ")[0][:28]
+        extra.append([button(f"{'🔕 Unfollow' if is_f else '🔔 Follow'} • {name}",
+                             callback_data=f"fl:{row['msg_id']}", style="danger" if is_f else "success")])
+        if len(seen_keys) >= 4:
+            break
+    fix_note = (f"<blockquote>✏️ Spelling theek karke <b>{escape(autocorrected)}</b> dikha raha hoon</blockquote>\n"
+                if autocorrected else "")
     await message.answer(
-        f"<blockquote>🔎 <b>{escape(query)}</b> • {len(results)} result(s)</blockquote>\n"
+        fix_note +
+        f"<blockquote>🔎 <b>{escape(autocorrected or query)}</b> • {len(results)} result(s)</blockquote>\n"
         "<blockquote>📅 Naya episode sabse upar • 👇 Tap karo, file seedha aayegi</blockquote>",
         reply_markup=results_kb(results, query, extra_rows=extra),
     )
@@ -714,7 +766,8 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
 
     ok, why = await reserve_quota(cb.from_user.id)
     if not ok:
-        await cb.message.answer(why, reply_markup=plans_kb(await db.plans()))
+        await _limit_hit(cb.from_user.id)
+        await cb.message.answer(why + _LIMIT_REMINDER_NOTE, reply_markup=plans_kb(await db.plans()))
         return
 
     mode, err = "", ""
@@ -791,14 +844,63 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
                 break
             except Exception as e:
                 err = str(e)
+    # ROOT FIX for "message to forward/copy not found": the MAIN_DATA post this
+    # catalog row points at was deleted. Retrying the same id can never work, so
+    # hide the stale row and deliver another live copy of the same file/episode.
+    if not mode and classify(err) == "missing":
+        tried = {delivery_msg_id}
+        await db.mark_stale(delivery_msg_id)
+        if int(movie["msg_id"]) != delivery_msg_id:
+            await db.mark_stale(int(movie["msg_id"]))
+        logging.warning("Stale MAIN_DATA post %s (%s) removed from catalog", delivery_msg_id, title)
+        for _ in range(3):
+            alt = await db.alternate_copy(movie, tried)
+            if not alt:
+                break
+            alt_id = int(alt["storage_msg_id"] or alt["msg_id"])
+            tried.add(alt_id)
+            try:
+                alt_caption = await format_movie_caption(bot, alt)
+            except Exception:
+                alt_caption = caption
+            try:
+                sent = await asyncio.wait_for(
+                    bot.copy_message(cb.from_user.id, STORAGE_CHANNEL, alt_id,
+                                     caption=alt_caption[:1024], parse_mode="HTML"),
+                    timeout=20,
+                )
+                delivered_message_id = getattr(sent, "message_id", 0)
+                mode, err = f"copy/alternate({alt_id})", ""
+                msg_id, title = int(alt["msg_id"]), alt["title"] or title
+                break
+            except Exception as e:
+                err = str(e)
+                if classify(err) == "missing":
+                    await db.mark_stale(alt_id)
+                else:
+                    break
+        if not mode:
+            err = err or "MAIN_DATA post deleted"
+            try:
+                await request_snapshot(bot)
+            except Exception:
+                pass
+
     if not mode:
         await refund_quota(cb.from_user.id)
         kind = classify(err)
         mode = f"failed({kind})"
-        await cb.message.answer(
-            "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
-            "aapka free count wapas kar diya gaya hai.</blockquote>"
-        )
+        if kind == "missing":
+            await cb.message.answer(
+                "<blockquote>⚠️ Ye episode channel se hata diya gaya hai, isliye list se bhi hata diya. "
+                "Show ka naam dobara search karo — naya copy upload hote hi mil jayega. "
+                "Aapka free count wapas kar diya gaya hai.</blockquote>"
+            )
+        else:
+            await cb.message.answer(
+                "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
+                "aapka free count wapas kar diya gaya hai.</blockquote>"
+            )
 
     if delivered_message_id and not mode.startswith("failed"):
         try:
@@ -863,7 +965,8 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         return
     ok, why = await reserve_quota(cb.from_user.id)
     if not ok:
-        await cb.message.answer(why, reply_markup=plans_kb(await db.plans()))
+        await _limit_hit(cb.from_user.id)
+        await cb.message.answer(why + _LIMIT_REMINDER_NOTE, reply_markup=plans_kb(await db.plans()))
         return
     try:
         import config as _cfg
@@ -915,6 +1018,17 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
             "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
             "aapka free count wapas kar diya gaya hai.</blockquote>"
         )
+
+
+@router.callback_query(F.data.startswith("sq:"))
+async def spelling_suggestion(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    """User tapped a 'did you mean' button — run that search for them."""
+    query = (cb.data or "")[3:].strip()
+    await cb.answer()
+    if not query or not cb.message:
+        return
+    msg = cb.message.model_copy(update={"from_user": cb.from_user}).as_(bot)
+    await do_search(msg, query, state, bot)
 
 
 @router.callback_query(F.data.startswith("send:"))

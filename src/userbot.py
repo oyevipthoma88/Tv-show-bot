@@ -1,0 +1,402 @@
+"""Owner user-account (Telethon) login + instant live mirror.
+
+The bot cannot read channels where it is not admin. The owner logs in a
+normal Telegram account from Owner Panel → 🔐 Login Account; that account
+(which has joined the source channels) watches every new upload and shares
+it into MAIN_DATA immediately, then indexes it so users get the latest
+episode on top of their search results.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import tempfile
+import time
+
+import config
+from db import db
+from movie_catalog import detect_content_type
+from utils import parse_caption
+
+log = logging.getLogger("userbot")
+
+_pending: dict[int, dict] = {}       # owner_id -> login-in-progress state
+_live_client = None
+_live_bot = None
+_queue: asyncio.Queue | None = None
+_worker: asyncio.Task | None = None
+_catchup: asyncio.Task | None = None
+_me_label = ""
+
+
+# ---------------- credentials ----------------
+async def load_saved_credentials() -> None:
+    """Restore API id/hash/session saved by the panel login (Mongo-backed settings)."""
+    saved_id = (await db.get("tg_api_id", "")).strip()
+    saved_hash = (await db.get("tg_api_hash", "")).strip()
+    saved_session = (await db.get("tg_session", "")).strip()
+    if not config.TG_API_ID and saved_id.isdigit():
+        config.TG_API_ID = int(saved_id)
+    if not config.TG_API_HASH and saved_hash:
+        config.TG_API_HASH = saved_hash
+    if saved_session:
+        config.TG_SESSION = saved_session
+
+
+def has_api() -> bool:
+    return bool(config.TG_API_ID and config.TG_API_HASH)
+
+
+async def set_api(api_id: int, api_hash: str) -> None:
+    config.TG_API_ID = int(api_id)
+    config.TG_API_HASH = api_hash.strip()
+    await db.set("tg_api_id", str(api_id))
+    await db.set("tg_api_hash", api_hash.strip())
+
+
+def _new_client(session: str = ""):
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    return TelegramClient(StringSession(session), int(config.TG_API_ID), config.TG_API_HASH,
+                          device_model="TV Show Bot", system_version="Linux", app_version="1.0")
+
+
+async def _persist() -> None:
+    try:
+        from mongo_store import save_non_movie_state
+        await save_non_movie_state()
+    except Exception as exc:
+        log.warning("Session save to Mongo failed: %s", exc)
+
+
+async def _reset_shared_clients() -> None:
+    """Old clients cache the previous session; drop them so they reconnect."""
+    try:
+        from mtproto_importer import close_mtproto
+        await close_mtproto()
+    except Exception:
+        pass
+    try:
+        import channel_search
+        if channel_search._client is not None:
+            try:
+                await channel_search._client.disconnect()
+            except Exception:
+                pass
+        channel_search._client = None
+    except Exception:
+        pass
+
+
+# ---------------- login flow ----------------
+async def start_login(owner_id: int, phone: str) -> str:
+    await cancel_login(owner_id)
+    client = _new_client()
+    await client.connect()
+    sent = await client.send_code_request(phone)
+    _pending[owner_id] = {"client": client, "phone": phone, "hash": sent.phone_code_hash}
+    return "code"
+
+
+async def submit_code(owner_id: int, code: str) -> str:
+    """Returns 'ok', 'password' (2FA needed) or raises."""
+    from telethon.errors import SessionPasswordNeededError
+    state = _pending.get(owner_id)
+    if not state:
+        raise RuntimeError("Login session expire ho gaya, dobara Login dabao.")
+    digits = "".join(ch for ch in code if ch.isdigit())
+    try:
+        await state["client"].sign_in(state["phone"], digits, phone_code_hash=state["hash"])
+    except SessionPasswordNeededError:
+        return "password"
+    return await _finish(owner_id)
+
+
+async def submit_password(owner_id: int, password: str) -> str:
+    state = _pending.get(owner_id)
+    if not state:
+        raise RuntimeError("Login session expire ho gaya, dobara Login dabao.")
+    await state["client"].sign_in(password=password)
+    return await _finish(owner_id)
+
+
+async def _finish(owner_id: int) -> str:
+    state = _pending.pop(owner_id)
+    client = state["client"]
+    session = client.session.save()
+    await client.disconnect()
+    config.TG_SESSION = session
+    await db.set("tg_session", session)
+    await _persist()
+    await _reset_shared_clients()
+    await stop_live()
+    if _live_bot is not None:
+        await start_live(_live_bot)
+    return "ok"
+
+
+async def cancel_login(owner_id: int) -> None:
+    state = _pending.pop(owner_id, None)
+    if state:
+        try:
+            await state["client"].disconnect()
+        except Exception:
+            pass
+
+
+async def logout() -> None:
+    session = config.TG_SESSION
+    await stop_live()
+    if session and has_api():
+        try:
+            client = _new_client(session)
+            await client.connect()
+            await client.log_out()
+        except Exception as exc:
+            log.warning("Telegram log_out failed: %s", exc)
+    config.TG_SESSION = ""
+    await db.set("tg_session", "")
+    await _persist()
+    await _reset_shared_clients()
+
+
+async def status_text() -> str:
+    if not has_api():
+        return "❌ API ID / API HASH set nahi hai."
+    if not config.TG_SESSION:
+        return "❌ Koi account login nahi hai."
+    live = "🟢 Live Mirror chal raha hai" if is_live() else "🔴 Live Mirror band hai"
+    who = _me_label or "connected account"
+    return f"✅ Logged in: <b>{who}</b>\n{live}"
+
+
+def is_live() -> bool:
+    return _live_client is not None and _live_client.is_connected()
+
+
+async def resolve_chat(value: str):
+    """(chat_id, title) of a channel the logged-in account can see, else None."""
+    if not (has_api() and config.TG_SESSION):
+        return None
+    from telethon import utils as tg_utils
+    client = _live_client if is_live() else None
+    temp = None
+    try:
+        if client is None:
+            temp = client = _new_client(config.TG_SESSION)
+            await client.connect()
+            if not await client.is_user_authorized():
+                return None
+        target = int(value) if value.lstrip("-").isdigit() else value
+        if isinstance(target, int):
+            await client.get_dialogs(limit=None)
+        entity = await client.get_entity(target)
+        return tg_utils.get_peer_id(entity), getattr(entity, "title", "") or str(value)
+    except Exception as exc:
+        log.warning("resolve_chat %s failed: %s", value, exc)
+        return None
+    finally:
+        if temp is not None:
+            await temp.disconnect()
+
+
+# ---------------- live mirror ----------------
+async def _source_ids() -> tuple[set[int], set[str]]:
+    raw = await db.get("movie_channels", "")
+    ids, names = set(), set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.lstrip("-").isdigit():
+            ids.add(int(item))
+        else:
+            names.add(item.lstrip("@").lower())
+    ids.discard(int(config.MAIN_DATA))
+    return ids, names
+
+
+def _format_duration(seconds) -> str:
+    seconds = int(seconds or 0)
+    if seconds <= 0:
+        return ""
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _doc_meta(document, caption: str) -> dict:
+    attrs = getattr(document, "attributes", []) or []
+    file_name = next((getattr(a, "file_name", "") for a in attrs if getattr(a, "file_name", "")), "")
+    duration = next((getattr(a, "duration", 0) for a in attrs if getattr(a, "duration", 0)), 0)
+    meta = parse_caption(caption or file_name)
+    meta["duration"] = _format_duration(duration)
+    if not meta.get("size"):
+        mb = (getattr(document, "size", 0) or 0) / 1048576
+        meta["size"] = f"{mb / 1024:.1f}GB" if mb > 1024 else f"{mb:.0f}MB"
+    mime = getattr(document, "mime_type", "") or ""
+    meta["file_type"] = "video" if mime.startswith("video/") else "audio" if mime.startswith("audio/") else "document"
+    return meta
+
+
+async def _send_to_main(client, message):
+    """Share into MAIN_DATA without re-upload; protected channels fall back to download+upload."""
+    from telethon.errors import FloodWaitError
+    caption = message.message or ""
+    for attempt in range(3):
+        try:
+            try:
+                return await client.send_file(config.MAIN_DATA, message.media, caption=caption,
+                                              formatting_entities=message.entities, silent=True)
+            except FloodWaitError:
+                raise
+            except Exception as exc:
+                log.info("Direct share blocked (%s); downloading and re-uploading", exc)
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = await client.download_media(message, file=tmp + os.sep)
+                    if not path:
+                        raise
+                    return await client.send_file(
+                        config.MAIN_DATA, path, caption=caption, formatting_entities=message.entities,
+                        attributes=getattr(message.document, "attributes", None),
+                        supports_streaming=True, silent=True,
+                    )
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds + 1)
+    return None
+
+
+async def _process(message) -> None:
+    client = _live_client
+    document = getattr(message, "document", None)
+    if client is None or not document:
+        return
+    caption = message.message or ""
+    key = f"tg:{document.id}:{getattr(document, 'access_hash', 0) or 0}"
+    chat_id = message.chat_id
+    if await db.has_duplicate_movie(key, caption):
+        log.info("Live mirror: duplicate %s/%s skipped", chat_id, message.id)
+        await db.set(f"live_last:{chat_id}", str(message.id))
+        return
+    sent = await _send_to_main(client, message)
+    if not sent:
+        log.error("Live mirror: failed to share %s/%s", chat_id, message.id)
+        return
+    sent_doc = getattr(sent, "document", None) or document
+    file_key = f"tg:{sent_doc.id}:{getattr(sent_doc, 'access_hash', 0) or 0}"
+    meta = _doc_meta(sent_doc, caption)
+    inserted = await db.upsert_movie(
+        sent.id, meta["title"], meta["year"], meta["quality"], meta["language"], meta["size"],
+        caption, file_key, meta["file_type"], detect_content_type(caption),
+        duration=meta["duration"], storage_msg_id=sent.id,
+    )
+    await db.set(f"live_last:{chat_id}", str(message.id))
+    if inserted and _live_bot is not None:
+        try:
+            from snapshot import request_snapshot
+            await request_snapshot(_live_bot)
+            from log_helper import log_new_movie_added
+            await log_new_movie_added(_live_bot, meta["title"], meta["quality"], chat_id, sent.id,
+                                      "live mirror (user account)", await db.movie_count(storage_only=True))
+        except Exception as exc:
+            log.warning("Live mirror log failed: %s", exc)
+    log.info("Live mirror: %s/%s -> MAIN_DATA %s (%s)", chat_id, message.id, sent.id, meta["title"])
+
+
+async def _run_worker() -> None:
+    while True:
+        message = await _queue.get()
+        try:
+            if await db.get("live_mirror_enabled", "1") != "0":
+                await _process(message)
+        except Exception:
+            log.exception("Live mirror failed for %s", getattr(message, "id", "?"))
+        finally:
+            _queue.task_done()
+
+
+async def _is_source(chat_id: int, username: str) -> bool:
+    ids, names = await _source_ids()
+    return chat_id in ids or (bool(username) and username.lower() in names)
+
+
+async def _catch_up() -> None:
+    """Pick up uploads that happened while the bot was offline (newest 200/source)."""
+    client = _live_client
+    ids, names = await _source_ids()
+    for target in [*ids, *names]:
+        try:
+            entity = await client.get_entity(target)
+            from telethon import utils as tg_utils
+            peer_id = tg_utils.get_peer_id(entity)
+            last = int((await db.get(f"live_last:{peer_id}", "0")) or 0)
+            if not last:
+                newest = await client.get_messages(entity, limit=1)
+                if newest:
+                    await db.set(f"live_last:{peer_id}", str(newest[0].id))
+                continue
+            missed = [m async for m in client.iter_messages(entity, min_id=last, limit=200) if m.document]
+            for m in reversed(missed):
+                await _queue.put(m)
+        except Exception as exc:
+            log.warning("Catch-up for %s failed: %s", target, exc)
+
+
+async def start_live(bot) -> bool:
+    global _live_client, _live_bot, _queue, _worker, _catchup, _me_label
+    _live_bot = bot
+    if _live_client is not None or not (has_api() and config.TG_SESSION):
+        return is_live()
+    from telethon import events
+    client = _new_client(config.TG_SESSION)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            log.warning("Live mirror: session not authorized; owner must login again")
+            await client.disconnect()
+            return False
+        me = await client.get_me()
+        _me_label = " ".join(x for x in [me.first_name, me.last_name] if x) + (f" (@{me.username})" if me.username else "")
+        await client.get_dialogs(limit=None)  # subscribe to channel updates
+    except Exception as exc:
+        log.error("Live mirror start failed: %s", exc)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return False
+
+    async def on_new(event):
+        msg = event.message
+        if not getattr(msg, "document", None):
+            return
+        chat = await event.get_chat()
+        if await _is_source(event.chat_id, getattr(chat, "username", "") or ""):
+            await _queue.put(msg)
+
+    client.add_event_handler(on_new, events.NewMessage())
+    _live_client = client
+    _queue = asyncio.Queue()
+    _worker = asyncio.create_task(_run_worker(), name="live-mirror-worker")
+    _catchup = asyncio.create_task(_catch_up(), name="live-mirror-catchup")
+    log.info("Live mirror started as %s", _me_label)
+    return True
+
+
+async def stop_live() -> None:
+    global _live_client, _worker, _catchup
+    for task in (_catchup, _worker):
+        if task is not None and not task.done():
+            task.cancel()
+    _worker = _catchup = None
+    if _live_client is not None:
+        try:
+            await _live_client.disconnect()
+        except Exception:
+            pass
+    _live_client = None
+
+
+__all__ = ["load_saved_credentials", "start_login", "submit_code", "submit_password", "cancel_login",
+           "logout", "status_text", "start_live", "stop_live", "is_live", "resolve_chat", "set_api", "has_api"]

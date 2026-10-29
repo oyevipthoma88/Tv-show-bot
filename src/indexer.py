@@ -505,6 +505,17 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
         stats.stop_reason = str(exc)
         return stats
 
+    # Source channel may belong to someone else where only the owner's user
+    # account (TG_SESSION) is a member, not the bot. In that case the bot
+    # cannot copy_message from it, so forward through the user account.
+    bot_can_read = True
+    if not same_channel:
+        try:
+            await bot.get_chat(src)
+        except Exception as exc:
+            bot_can_read = False
+            logging.info("Bot cannot open source %s (%s); using user account to forward", src, exc)
+
     # Load only file_id + caption for dedup — not full rows
     dedup_files, dedup_captions = await db.get_dedup_sets()
 
@@ -646,7 +657,22 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
             nonlocal flood_count, last_flood_time
             src_mid = info["id"]
             fwd = None
-            for attempt in range(5):
+            if not bot_can_read:
+                try:
+                    from userbot import _send_to_main
+                    sent = await asyncio.wait_for(_send_to_main(client, info["msg"]), timeout=600)
+                except Exception as exc:
+                    async with lock:
+                        stats.errors += 1
+                        stats.last_error = f"user-forward failed: {exc}"
+                    return
+                if sent is None:
+                    async with lock:
+                        stats.errors += 1
+                        stats.last_error = "user-forward returned nothing"
+                    return
+                fwd = type("Fwd", (), {"message_id": int(getattr(sent, "id", 0) or 0)})()
+            for attempt in range(0 if fwd is not None else 5):
                 async with copy_sem:
                     try:
                         fwd = await asyncio.wait_for(
@@ -748,6 +774,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
                              (info["caption_key"] and info["caption_key"] in dedup_captions):
                             stats.skipped += 1
                         else:
+                            info["msg"] = message
                             await work_queue.put(info)
                             if info["file_key"]:
                                 dedup_files.add(info["file_key"])

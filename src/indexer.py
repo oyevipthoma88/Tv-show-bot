@@ -304,6 +304,20 @@ async def decline_source(callback, bot: Bot):
 
 
 # ---------------- historical scan ----------------
+async def bot_is_member(bot: Bot, chat_id) -> bool:
+    """True only if the bot can actually read/copy posts of this chat.
+
+    get_chat() alone is not enough: it succeeds for public channels the bot
+    never joined, and then every copy/forward silently fails as "not found".
+    """
+    try:
+        me = await bot.me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return getattr(member, "status", "") in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
 class ScanStats:
     def __init__(self) -> None:
         self.found = 0
@@ -483,7 +497,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
     - Periodic MongoDB saves mid-scan so progress is never lost
     - Reconnects Telethon automatically on disconnect
     """
-    from mtproto_importer import _get_client
+    from mtproto_importer import _get_client, resolve_entity
     from config import TG_API_ID, TG_API_HASH, TG_SESSION, SCAN_COMMIT_BATCH
 
     stats = ScanStats()
@@ -499,10 +513,10 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
 
     same_channel = str(src) == str(dump)
     try:
-        entity = await client.get_entity(src)
+        entity = await resolve_entity(client, src)
     except Exception as exc:
-        stats.last_error = str(exc)
-        stats.stop_reason = str(exc)
+        stats.last_error = f"user account cannot open {src}: {exc}"
+        stats.stop_reason = stats.last_error
         return stats
 
     # Source channel may belong to someone else where only the owner's user
@@ -510,11 +524,9 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
     # cannot copy_message from it, so forward through the user account.
     bot_can_read = True
     if not same_channel:
-        try:
-            await bot.get_chat(src)
-        except Exception as exc:
-            bot_can_read = False
-            logging.info("Bot cannot open source %s (%s); using user account to forward", src, exc)
+        bot_can_read = await bot_is_member(bot, src)
+        if not bot_can_read:
+            logging.info("Bot is not a member of source %s; using user account to forward", src)
 
     # Load only file_id + caption for dedup — not full rows
     dedup_files, dedup_captions = await db.get_dedup_sets()
@@ -635,7 +647,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
                     stats.stop_reason = stats.last_error
                     break
                 try:
-                    entity = await client.get_entity(src)
+                    entity = await resolve_entity(client, src)
                 except Exception:
                     stats.last_error = "Could not re-resolve channel entity"
                     stats.stop_reason = stats.last_error
@@ -653,26 +665,40 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
         work_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         reader_done = asyncio.Event()
 
+        async def user_forward(info: dict):
+            """Forward one post into MAIN_DATA through the owner's user account."""
+            try:
+                from userbot import _send_to_main
+                msg = info.get("msg")
+                if msg is None:
+                    msg = await client.get_messages(entity, ids=info["id"])
+                sent = await asyncio.wait_for(_send_to_main(client, msg), timeout=600)
+            except Exception as exc:
+                async with lock:
+                    stats.errors += 1
+                    stats.last_error = f"user-forward failed: {exc}"
+                return None
+            if sent is None or not getattr(sent, "id", 0):
+                async with lock:
+                    stats.errors += 1
+                    stats.last_error = "user-forward returned nothing"
+                return None
+            return type("Fwd", (), {"message_id": int(sent.id)})()
+
         async def copy_and_index(info: dict) -> None:
-            nonlocal flood_count, last_flood_time
+            nonlocal flood_count, last_flood_time, bot_can_read
             src_mid = info["id"]
             fwd = None
             if not bot_can_read:
-                try:
-                    from userbot import _send_to_main
-                    sent = await asyncio.wait_for(_send_to_main(client, info["msg"]), timeout=600)
-                except Exception as exc:
-                    async with lock:
-                        stats.errors += 1
-                        stats.last_error = f"user-forward failed: {exc}"
+                fwd = await user_forward(info)
+                if fwd is None:
                     return
-                if sent is None:
-                    async with lock:
-                        stats.errors += 1
-                        stats.last_error = "user-forward returned nothing"
-                    return
-                fwd = type("Fwd", (), {"message_id": int(getattr(sent, "id", 0) or 0)})()
-            for attempt in range(0 if fwd is not None else 5):
+            # NOTE: the old code used `for attempt in range(0): ... else:` for
+            # user-forwarded posts. A for-loop that never runs still executes
+            # its `else`, so every user-forwarded post was counted as an error
+            # ("max retries exceeded") and never indexed.
+            attempts = 0 if fwd is not None else 5
+            for attempt in range(attempts):
                 async with copy_sem:
                     try:
                         fwd = await asyncio.wait_for(
@@ -696,6 +722,12 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
                                 last_flood_time = time.monotonic()
                             await asyncio.sleep(wait)
                             continue
+                        elif kind == "fatal":
+                            # Bot can't read this source (not member / no rights):
+                            # switch the whole scan to the user account.
+                            logging.info("Bot copy from %s failed (%s); switching to user account", src, txt)
+                            bot_can_read = False
+                            break
                         elif kind == "protected":
                             async with lock:
                                 stats.protected += 1
@@ -712,10 +744,14 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
                                 stats.errors += 1
                                 stats.last_error = txt
                             return
-            else:
+            if fwd is None and not bot_can_read:
+                fwd = await user_forward(info)
+                if fwd is None:
+                    return
+            if fwd is None:
                 async with lock:
                     stats.errors += 1
-                    stats.last_error = "max retries exceeded"
+                    stats.last_error = stats.last_error or "max retries exceeded"
                 return
 
             if fwd is None:
@@ -758,7 +794,10 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
 
         async def reader():
             """Read messages via Telethon and feed them into the work queue."""
-            nonlocal started, cursor_max
+            # client/entity/last_id/total are reassigned here; without nonlocal
+            # Python treats them as locals and the reader crashed instantly
+            # with UnboundLocalError on every user-only source scan.
+            nonlocal started, cursor_max, client, entity, last_id, total
             for retry in range(3):
                 try:
                     async for message in client.iter_messages(
@@ -806,7 +845,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
                             stats.stop_reason = stats.last_error
                         break
                     try:
-                        entity = await client.get_entity(src)
+                        entity = await resolve_entity(client, src)
                     except Exception:
                         async with lock:
                             stats.last_error = "Could not re-resolve channel entity"

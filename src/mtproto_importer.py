@@ -15,9 +15,24 @@ _mtproto_client = None
 
 
 async def _get_client():
+    """Return ONE shared, authorized Telethon client for the owner session.
+
+    Prefer the live-mirror client: it is already connected, authorized and has
+    loaded all dialogs (so private channels resolve by numeric ID). Opening a
+    second connection with the same StringSession caused "User is already
+    connected" / "Server resent the older message" noise and an empty entity
+    cache, which made user-only sources fail to open.
+    """
     global _mtproto_client
     if not (config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION):
         return None
+    try:
+        import userbot
+        live = getattr(userbot, "_live_client", None)
+        if live is not None and live.is_connected():
+            return live
+    except Exception:
+        pass
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     if _mtproto_client is None:
@@ -28,6 +43,32 @@ async def _get_client():
         logging.error("TG_SESSION is not authorized; generate a new StringSession")
         return None
     return _mtproto_client
+
+
+_dialogs_loaded: set[int] = set()
+
+
+async def resolve_entity(client, peer):
+    """get_entity that also works for private channels the account joined.
+
+    A fresh StringSession has no access_hash cache, so get_entity(-100…) fails
+    with "Could not find the input entity". Loading dialogs once fills the
+    cache; then retry. Raises the last error if the account really can't see it.
+    """
+    try:
+        return await client.get_entity(peer)
+    except Exception as first:
+        key = id(client)
+        if key not in _dialogs_loaded:
+            try:
+                await client.get_dialogs(limit=None)
+                _dialogs_loaded.add(key)
+            except Exception as exc:
+                logging.warning("Dialog load for entity cache failed: %s", exc)
+        try:
+            return await client.get_entity(peer)
+        except Exception:
+            raise first
 
 
 class ImportStats:
@@ -225,9 +266,13 @@ async def import_main_data(progress=None, min_id: int = 0, max_id: int = 0,
 async def close_mtproto() -> None:
     global _mtproto_client
     if _mtproto_client is not None:
-        await _mtproto_client.disconnect()
+        try:
+            await _mtproto_client.disconnect()
+        except Exception:
+            pass
     _mtproto_client = None
+    _dialogs_loaded.clear()
 
 
-__all__ = ["ImportStats", "deliver_main_data_to_user", "enumerate_message_ids", "find_duplicate_caption_ids", "import_main_data", "close_mtproto"]
+__all__ = ["ImportStats", "deliver_main_data_to_user", "enumerate_message_ids", "find_duplicate_caption_ids", "import_main_data", "close_mtproto", "resolve_entity"]
 

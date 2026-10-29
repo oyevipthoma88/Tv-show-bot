@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import logging
 import os
 import re
@@ -18,7 +19,7 @@ from transfer_manager import transfer_manager
 from helper_pool import helper_pool
 from db import db
 from keyboards import back_panel, button, owner_panel_kb, plans_kb, plans_text
-from indexer import ScanStats, scan_ids, scan_range, scan_channel_fast
+from indexer import ScanStats, scan_ids, scan_range, scan_channel_fast, bot_is_member
 from snapshot import SNAPSHOT_MARKER, request_snapshot
 from utils import get_movie_channel, human_left, is_premium, resolve_channel, user_tag
 
@@ -1074,25 +1075,39 @@ async def do_scan(message: Message, bot: Bot, state: FSMContext, force_main_data
             )
 
     user_only: set = set()
+    fail_reasons: dict = {}
 
     async def _check_chat(cid, allow_user: bool = True):
+        """Open a chat via the bot; if the bot isn't a real member, via the owner's user account.
+
+        Source channels can belong to someone else where only the owner's user
+        ID (TG_SESSION) is a member. Those are scanned + forwarded through the
+        user account instead of failing with "open nahi hua".
+        """
+        bot_exc = None
         try:
-            return await bot.get_chat(cid)
+            chat = await bot.get_chat(cid)
+            if not allow_user or await bot_is_member(bot, cid):
+                return chat
+            bot_exc = "bot is not a member"
         except Exception as exc:
+            bot_exc = exc
             if not allow_user:
                 return None
-            # Fallback: channel kisi aur ka hai aur sirf owner ki user ID member hai.
-            try:
-                from mtproto_importer import _get_client
-                client = await _get_client()
-                if client is not None:
-                    entity = await client.get_entity(cid)
-                    user_only.add(cid)
-                    logging.info("Source %s opened via user account (bot: %s)", cid, exc)
-                    return entity
-            except Exception as uexc:
-                logging.warning("Source %s not reachable by bot (%s) or user (%s)", cid, exc, uexc)
-            return None
+        try:
+            from mtproto_importer import _get_client, resolve_entity
+            client = await _get_client()
+            if client is None:
+                logging.warning("Source %s not reachable by bot (%s); TG_SESSION not logged in", cid, bot_exc)
+                return None
+            entity = await resolve_entity(client, cid)
+            user_only.add(cid)
+            logging.info("Source %s opened via user account (bot: %s)", cid, bot_exc)
+            return entity
+        except Exception as uexc:
+            logging.warning("Source %s not reachable by bot (%s) or user (%s)", cid, bot_exc, uexc)
+            fail_reasons[cid] = f"bot: {str(bot_exc)[:120]} | user: {str(uexc)[:120]}"
+        return None
     dump = MAIN_DATA
     all_chats = await asyncio.gather(_check_chat(dump, False), *[_check_chat(cid) for cid in channel_ids])
     main_chat = all_chats[0]
@@ -1105,7 +1120,8 @@ async def do_scan(message: Message, bot: Bot, state: FSMContext, force_main_data
         if chat is None:
             return await message.answer(
                 f"❌ Source channel <code>{channel_ids[idx]}</code> open nahi hua.\n"
-                "Chat ID sahi hai aur bot YA aapki user ID (TG_SESSION) source channel me member hai, ye check karo.",
+                "Chat ID sahi hai aur bot YA aapki user ID (TG_SESSION) source channel me member hai, ye check karo.\n"
+                f"<code>{_html.escape(fail_reasons.get(channel_ids[idx], ''))}</code>",
                 reply_markup=owner_panel_kb(),
             )
 

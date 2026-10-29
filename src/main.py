@@ -21,7 +21,7 @@ from helper_pool import helper_pool
 from db import db
 from keyboards import results_kb
 from snapshot import cancel_snapshot_task, remove_legacy_telegram_snapshots, restore_snapshot
-from mongo_store import close_mongo, restore_non_movie_state, save_non_movie_state, restore_movie_catalog, save_movie_catalog
+from mongo_store import close_mongo, restore_non_movie_state, save_non_movie_state, restore_movie_catalog, save_movie_catalog, purge_orphan_chunks
 from mtproto_importer import close_mtproto
 from log_helper import log_auto_delete
 
@@ -44,6 +44,7 @@ async def main() -> None:
     mongo_restored = await restore_non_movie_state()
     if mongo_restored:
         logging.info("Users/settings restored from MongoDB")
+    await purge_orphan_chunks()  # reclaim Mongo space from failed saves
     movie_restored = await restore_movie_catalog()
     if movie_restored:
         logging.info("Movie catalog restored from MongoDB (%s movies)", await db.movie_count())
@@ -366,7 +367,7 @@ async def _scan_single_channel(client, channel_id: int) -> int:
         batch = []
         t0 = time.time()
         max_id_seen = min_id
-        async for msg in client.iter_messages(channel_id, min_id=min_id, limit=None, batch_size=1000, wait_time=2):
+        async for msg in client.iter_messages(channel_id, min_id=min_id, limit=None, wait_time=2):
             try:
                 if not msg.media:
                     continue

@@ -31,6 +31,10 @@ _me_label = ""
 _watchdog: asyncio.Task | None = None
 _bot_admin_cache: dict[int, tuple[bool, float]] = {}
 _last_alert: dict[str, float] = {}
+_workers: list[asyncio.Task] = []
+_inflight: set[str] = set()
+LIVE_WORKERS = max(1, int(os.getenv("LIVE_WORKERS", "6")))
+CATCHUP_PARALLEL = max(1, int(os.getenv("CATCHUP_PARALLEL", "5")))
 
 
 # ---------------- credentials ----------------
@@ -308,9 +312,19 @@ async def _process(message) -> None:
     key = f"tg:{document.id}:{getattr(document, 'access_hash', 0) or 0}"
     chat_id = message.chat_id
     source_meta = _doc_meta(document, caption)
+    if key in _inflight:
+        return
+    _inflight.add(key)
+    try:
+        await _process_locked(message, client, document, caption, key, chat_id, source_meta)
+    finally:
+        _inflight.discard(key)
+
+
+async def _process_locked(message, client, document, caption, key, chat_id, source_meta):
     if await db.has_duplicate_upload(key, caption, source_meta.get("size", "")):
         log.info("Live mirror: duplicate %s/%s skipped", chat_id, message.id)
-        await db.set(f"live_last:{chat_id}", str(message.id))
+        await _bump_last(chat_id, message.id)
         return
     try:
         sent = await _send_to_main(client, message)
@@ -336,7 +350,7 @@ async def _process(message) -> None:
         caption, file_key, meta["file_type"], detect_content_type(caption),
         duration=meta["duration"], storage_msg_id=sent.id, added_at=posted_at,
     )
-    await db.set(f"live_last:{chat_id}", str(message.id))
+    await _bump_last(chat_id, message.id)
     if inserted and _live_bot is not None:
         try:
             from snapshot import request_catalog_save, request_snapshot
@@ -350,6 +364,77 @@ async def _process(message) -> None:
         except Exception as exc:
             log.warning("Live mirror post-index step failed: %s", exc)
     log.info("Live mirror: %s/%s -> MAIN_DATA %s (%s)", chat_id, message.id, sent.id, meta["title"])
+
+
+async def _bump_last(chat_id: int, msg_id: int) -> None:
+    """Parallel workers may finish out of order — only move the cursor forward."""
+    current = int((await db.get(f"live_last:{chat_id}", "0")) or 0)
+    if int(msg_id) > current:
+        await db.set(f"live_last:{chat_id}", str(msg_id))
+
+
+async def import_to_main(chat_id: int, msg_id: int):
+    """On-demand: pull one file from a joined (non-admin) source into MAIN_DATA and
+    return the MAIN_DATA message id, so the bot can deliver it to a user."""
+    client = _live_client
+    if client is None:
+        return None
+    try:
+        message = await client.get_messages(chat_id, ids=msg_id)
+        if not message or not getattr(message, "document", None):
+            return None
+        sent = await _send_to_main(client, message)
+        if not sent:
+            return None
+        sent_doc = getattr(sent, "document", None) or message.document
+        caption = message.message or ""
+        meta = _doc_meta(sent_doc, caption)
+        await db.upsert_movie(
+            sent.id, meta["title"], meta["year"], meta["quality"], meta["language"], meta["size"],
+            caption, f"tg:{sent_doc.id}:{getattr(sent_doc, 'access_hash', 0) or 0}", meta["file_type"],
+            detect_content_type(caption), duration=meta["duration"], storage_msg_id=sent.id,
+            added_at=int(time.time()),
+        )
+        try:
+            from snapshot import request_catalog_save
+            await request_catalog_save()
+        except Exception:
+            pass
+        return sent.id
+    except Exception as exc:
+        log.warning("import_to_main %s/%s failed: %s", chat_id, msg_id, exc)
+        return None
+
+
+async def search_sources(query: str, limit: int = 10) -> list[dict]:
+    """Search every source channel the logged-in account has joined, in parallel."""
+    client = _live_client
+    if client is None or not query.strip():
+        return []
+    ids, names = await _source_ids()
+    sem = asyncio.Semaphore(CATCHUP_PARALLEL)
+
+    async def one(target):
+        out = []
+        async with sem:
+            try:
+                entity = await client.get_entity(target)
+                from telethon import utils as tg_utils
+                peer = tg_utils.get_peer_id(entity)
+                async for m in client.iter_messages(entity, search=query.strip()[:100], limit=limit):
+                    if getattr(m, "document", None):
+                        cap = m.message or ""
+                        title = (cap.split("\n")[0][:200].strip() if cap else "") or _doc_meta(m.document, cap).get("title") or f"Episode {m.id}"
+                        out.append({"msg_id": m.id, "channel_id": peer, "title": title,
+                                    "caption": cap, "source": True})
+            except Exception as exc:
+                log.debug("source search %s failed: %s", target, exc)
+        return out
+
+    results = await asyncio.wait_for(asyncio.gather(*(one(t) for t in [*ids, *names])), timeout=20)
+    flat = [r for chunk in results for r in chunk]
+    flat.sort(key=lambda r: r["msg_id"], reverse=True)
+    return flat[: limit * 2]
 
 
 async def _run_worker() -> None:
@@ -373,7 +458,12 @@ async def _catch_up() -> None:
     """Pick up uploads that happened while the bot was offline (newest 200/source)."""
     client = _live_client
     ids, names = await _source_ids()
-    for target in [*ids, *names]:
+    sem = asyncio.Semaphore(CATCHUP_PARALLEL)
+    await asyncio.gather(*(_catch_up_one(client, t, sem) for t in [*ids, *names]))
+
+
+async def _catch_up_one(client, target, sem) -> None:
+    async with sem:
         try:
             entity = await client.get_entity(target)
             from telethon import utils as tg_utils
@@ -383,12 +473,13 @@ async def _catch_up() -> None:
                 newest = await client.get_messages(entity, limit=1)
                 if newest:
                     await db.set(f"live_last:{peer_id}", str(newest[0].id))
-                continue
+                return
             missed = [m async for m in client.iter_messages(entity, min_id=last, limit=200) if m.document]
             for m in reversed(missed):
                 await _queue.put(m)
         except Exception as exc:
             log.warning("Catch-up for %s failed: %s", target, exc)
+            return
 
 
 async def start_live(bot) -> bool:
@@ -430,7 +521,8 @@ async def start_live(bot) -> bool:
     client.add_event_handler(on_new, events.NewMessage())
     _live_client = client
     _queue = asyncio.Queue()
-    _worker = asyncio.create_task(_run_worker(), name="live-mirror-worker")
+    _workers[:] = [asyncio.create_task(_run_worker(), name=f"live-mirror-worker-{i}") for i in range(LIVE_WORKERS)]
+    _worker = _workers[0]
     _catchup = asyncio.create_task(_catch_up(), name="live-mirror-catchup")
     _ensure_watchdog()
     log.info("Live mirror started as %s", _me_label)
@@ -466,7 +558,8 @@ async def _watch() -> None:
 
 async def stop_live(keep_watchdog: bool = False) -> None:
     global _live_client, _worker, _catchup, _watchdog
-    tasks = [_catchup, _worker] + ([] if keep_watchdog else [_watchdog])
+    tasks = [_catchup, _worker, *_workers] + ([] if keep_watchdog else [_watchdog])
+    _workers.clear()
     if not keep_watchdog:
         _watchdog = None
     for task in tasks:
@@ -482,4 +575,5 @@ async def stop_live(keep_watchdog: bool = False) -> None:
 
 
 __all__ = ["load_saved_credentials", "start_login", "submit_code", "submit_password", "cancel_login",
-           "logout", "status_text", "start_live", "stop_live", "is_live", "resolve_chat", "set_api", "has_api"]
+           "logout", "status_text", "start_live", "stop_live", "is_live", "resolve_chat", "set_api", "has_api",
+           "import_to_main", "search_sources"]

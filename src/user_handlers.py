@@ -574,6 +574,10 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
     if not results:
         try:
             direct_results = await search_channel(query, limit=50)
+            if not direct_results:
+                # Last resort: search every source channel the logged-in account has joined.
+                import userbot
+                direct_results = await userbot.search_sources(query, limit=10)
             logging.info("Direct search '%s': %s found", query, len(direct_results or []))
         except Exception as _e:
             logging.warning("Direct search error: %s", _e)
@@ -590,16 +594,18 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
             for _r in _rows[:10]:
                 title = (_r.get('title') or 'Episode')[:60]
                 _ch_id = _r.get('channel_id', STORAGE_CHANNEL)
-                _btns.append([InlineKeyboardButton(
-                    text=f"📺 {title}",
-                    callback_data=f"directdl:{_ch_id}:{_r.get('msg_id')}"
+                _btns.append([button(
+                    f"📺 {title}",
+                    callback_data=f"directdl:{_ch_id}:{_r.get('msg_id')}",
+                    style="success",
                 )])
             _support_url = await db.get("support_url", "") or SUPPORT_URL
             if _support_url:
-                _btns.append([InlineKeyboardButton(text="📞 Support / Request Show", url=_support_url)])
-            _btns.append([InlineKeyboardButton(text="🏠 Home", callback_data="home")])
+                _btns.append([button("📞 Support / Request Show", url=_support_url, style="primary")])
+            _btns.append([button("🏠 Home", callback_data="home", style="danger")])
             await message.answer(
-                f"✅ <b>{escape(query)}</b> ke liye {len(_rows)} results mile!\nEpisode select karo 👇",
+                f"<blockquote>✅ <b>{escape(query)}</b> ke liye <b>{len(_rows)}</b> results mile!</blockquote>\n"
+                "<blockquote expandable>👇 Episode select karo — file turant aa jayegi.</blockquote>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=_btns)
             )
             return
@@ -853,15 +859,23 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await cb.message.answer(why, reply_markup=plans_kb(await db.plans()))
         return
     try:
-        caption = "📺 <b>Episode</b>"
+        import config as _cfg
+        if channel_id != int(_cfg.MAIN_DATA) and channel_id not in set(getattr(_cfg, "MAIN_CHANNELS", []) or []):
+            # Found in a joined source channel: mirror into MAIN_DATA first, then deliver.
+            import userbot
+            new_id = await userbot.import_to_main(channel_id, msg_id)
+            if not new_id:
+                raise RuntimeError("source import failed")
+            channel_id, msg_id = int(_cfg.MAIN_DATA), int(new_id)
+        caption = "<blockquote>📺 <b>Episode</b></blockquote>"
         try:
             delete_minutes = int(await db.get("auto_delete_minutes", "0"))
         except (TypeError, ValueError):
             delete_minutes = 0
         if 1 <= delete_minutes <= 1440:
             caption += (
-                f"\n\n⚠️ <b>Security:</b> Ye episode {_expiry_label(delete_minutes)} me auto-delete hoga. "
-                "Episode milte hi save ya forward kar lo."
+                f"\n<blockquote>⚠️ <b>Security:</b> Ye episode {_expiry_label(delete_minutes)} me auto-delete hoga. "
+                "Episode milte hi save ya forward kar lo.</blockquote>"
             )
         copied = await asyncio.wait_for(
             bot.copy_message(
@@ -871,7 +885,7 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
                 caption=caption[:1024],
                 parse_mode="HTML",
             ),
-            timeout=8,
+            timeout=20,
         )
         copied_id = getattr(copied, "message_id", 0)
         if copied_id and 1 <= delete_minutes <= 1440:

@@ -476,7 +476,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
 
     Optimizations:
     - Uses db.get_dedup_sets() instead of loading all full rows
-    - Telethon batch_size=1000 for faster MTProto reads
+    - Telethon reads 100 msgs per MTProto request (iter_messages has no batch_size arg)
     - Adaptive concurrency: starts high, backs off on flood errors
     - Exponential backoff retry with up to 5 attempts on flood
     - Durable resume cursor so interrupted scans continue from where they stopped
@@ -570,13 +570,13 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
         }
 
     if same_channel:
-        # batch_size controls how many messages Telethon fetches per MTProto request.
+        # NOTE: Telethon iter_messages() does not accept batch_size (crashed imports).
         # 1000 is optimal for large channels — fewer round-trips than the default 100.
         # Retry loop: reconnect Telethon on transient disconnects.
         for retry in range(3):
             try:
                 async for message in client.iter_messages(
-                    entity, limit=None, wait_time=0, batch_size=1000,
+                    entity, limit=None, wait_time=0,
                     max_id=cursor_max or None,
                 ):
                     last_id = int(getattr(message, "id", 0) or 0)
@@ -736,7 +736,7 @@ async def scan_channel_fast(bot: Bot, src, dump: int, progress=None,
             for retry in range(3):
                 try:
                     async for message in client.iter_messages(
-                        entity, limit=None, wait_time=0, batch_size=1000,
+                        entity, limit=None, wait_time=0,
                         max_id=cursor_max or None,
                     ):
                         last_id = int(getattr(message, "id", 0) or 0)

@@ -150,7 +150,7 @@ async def import_main_data(progress=None, min_id: int = 0, max_id: int = 0,
     for attempt in range(max(1, attempts)):
         try:
             async for message in client.iter_messages(
-                MAIN_DATA, min_id=min_id, max_id=cursor_max, limit=None, wait_time=2, batch_size=1000,
+                MAIN_DATA, min_id=min_id, max_id=cursor_max, limit=None, wait_time=2,
             ):
                 last_id = int(getattr(message, "id", 0) or 0)
                 stats.checked += 1

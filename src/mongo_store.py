@@ -134,6 +134,9 @@ async def save_movie_catalog():
         now = datetime.now(timezone.utc)
         generation = now.strftime("%Y%m%dT%H%M%S%f")
         previous = await collection.find_one({"_id": "movies"}, {"generation": 1, "chunk_count": 1})
+        # Free space first: drop orphan chunks left by failed/timed-out saves.
+        # These piled up and filled the 512 MB Atlas quota (writes blocked).
+        await purge_orphan_chunks(collection, previous)
         chunk_count = 0
         row_count = 0
         after_msg_id = 0
@@ -172,10 +175,48 @@ async def save_movie_catalog():
         return True
     except asyncio.TimeoutError:
         logging.warning("Mongo movie catalog save timeout")
+        await _drop_generation_safe(locals().get("collection"), locals().get("generation"))
         return False
     except Exception as e:
-        logging.warning(f"Mongo movie catalog save error: {type(e).__name__}: {e}")
+        logging.warning(f"Mongo movie catalog save error: {type(e).__name__}: {str(e)[:200]}")
+        await _drop_generation_safe(locals().get("collection"), locals().get("generation"))
         return False
+
+
+async def _drop_generation_safe(collection, generation) -> None:
+    """Remove a partially written generation so failed saves never leak space."""
+    if collection is None or not generation:
+        return
+    try:
+        manifest = await collection.find_one({"_id": "movies"}, {"generation": 1})
+        if (manifest or {}).get("generation") == generation:
+            return  # it was published; keep it
+        await collection.delete_many({"_id": {"$regex": f"^movies:{generation}:"}})
+    except Exception as exc:
+        logging.warning("Mongo partial-generation cleanup failed: %s", exc)
+
+
+async def purge_orphan_chunks(collection=None, manifest=None) -> int:
+    """Delete every movies:* chunk not referenced by the live manifest. Deletes are
+    allowed even when Atlas blocks writes for quota, so this recovers the cluster."""
+    try:
+        if collection is None:
+            collection = await _collection_or_none()
+        if collection is None:
+            return 0
+        if manifest is None:
+            manifest = await collection.find_one({"_id": "movies"}, {"generation": 1, "chunk_count": 1})
+        gen = str((manifest or {}).get("generation", ""))
+        keep = {f"movies:{gen}:{i}" if gen else f"movies:{i}"
+                for i in range(int((manifest or {}).get("chunk_count", 0)))}
+        query = {"_id": {"$regex": "^movies:", "$nin": list(keep)}}
+        result = await collection.delete_many(query)
+        if result.deleted_count:
+            logging.info("Mongo purged %d orphan movie chunks", result.deleted_count)
+        return int(result.deleted_count)
+    except Exception as exc:
+        logging.warning("Mongo orphan purge failed: %s", exc)
+        return 0
 
 
 async def save_non_movie_state():
@@ -265,4 +306,4 @@ async def close_mongo():
     _collection = None
 
 
-__all__ = ["PERSISTED_TABLES", "NON_MOVIE_TABLES", "MOVIE_TABLES", "restore_non_movie_state", "save_non_movie_state", "restore_movie_catalog", "save_movie_catalog", "close_mongo"]
+__all__ = ["purge_orphan_chunks", "PERSISTED_TABLES", "NON_MOVIE_TABLES", "MOVIE_TABLES", "restore_non_movie_state", "save_non_movie_state", "restore_movie_catalog", "save_movie_catalog", "close_mongo"]

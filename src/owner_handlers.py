@@ -1073,13 +1073,28 @@ async def do_scan(message: Message, bot: Bot, state: FSMContext, force_main_data
                 reply_markup=owner_panel_kb(),
             )
 
-    async def _check_chat(cid):
+    user_only: set = set()
+
+    async def _check_chat(cid, allow_user: bool = True):
         try:
             return await bot.get_chat(cid)
-        except Exception:
+        except Exception as exc:
+            if not allow_user:
+                return None
+            # Fallback: channel kisi aur ka hai aur sirf owner ki user ID member hai.
+            try:
+                from mtproto_importer import _get_client
+                client = await _get_client()
+                if client is not None:
+                    entity = await client.get_entity(cid)
+                    user_only.add(cid)
+                    logging.info("Source %s opened via user account (bot: %s)", cid, exc)
+                    return entity
+            except Exception as uexc:
+                logging.warning("Source %s not reachable by bot (%s) or user (%s)", cid, exc, uexc)
             return None
     dump = MAIN_DATA
-    all_chats = await asyncio.gather(_check_chat(dump), *[_check_chat(cid) for cid in channel_ids])
+    all_chats = await asyncio.gather(_check_chat(dump, False), *[_check_chat(cid) for cid in channel_ids])
     main_chat = all_chats[0]
     if main_chat is None:
         return await message.answer(
@@ -1090,7 +1105,7 @@ async def do_scan(message: Message, bot: Bot, state: FSMContext, force_main_data
         if chat is None:
             return await message.answer(
                 f"❌ Source channel <code>{channel_ids[idx]}</code> open nahi hua.\n"
-                "Chat ID sahi hai aur bot source channel me member/admin hai, ye check karo.",
+                "Chat ID sahi hai aur bot YA aapki user ID (TG_SESSION) source channel me member hai, ye check karo.",
                 reply_markup=owner_panel_kb(),
             )
 
@@ -1123,8 +1138,9 @@ async def do_scan(message: Message, bot: Bot, state: FSMContext, force_main_data
 
     aggregate = ScanStats()
     for channel_id in channel_ids:
-        if enumerate_history:
-            resume_key = f"scanall_cursor:{channel_id}"
+        if enumerate_history or channel_id in user_only:
+            # User-only sources must go through Telethon (bot can't copy from them).
+            resume_key = f"scanall_cursor:{channel_id}" if enumerate_history else ""
             stats = await scan_channel_fast(bot, channel_id, dump, progress=progress, resume_key=resume_key)
         else:
             stats = await scan_range(bot, channel_id, dump, scan_start, scan_end, progress=progress, concurrency=32)

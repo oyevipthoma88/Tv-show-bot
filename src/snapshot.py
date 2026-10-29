@@ -87,3 +87,25 @@ async def cancel_snapshot_task() -> None:
 
 
 __all__ = ["create_snapshot", "restore_snapshot", "remove_legacy_telegram_snapshots", "request_snapshot", "cancel_snapshot_task"]
+
+
+_catalog_task: asyncio.Task | None = None
+
+
+async def request_catalog_save(delay: float = 60.0) -> None:
+    """Debounced MongoDB save of the episode catalog (live uploads survive restarts)."""
+    global _catalog_task
+    if _catalog_task and not _catalog_task.done():
+        return
+
+    async def worker() -> None:
+        await asyncio.sleep(delay)
+        try:
+            from mongo_store import save_movie_catalog
+            await save_movie_catalog()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.warning("Catalog save failed: %s", exc)
+
+    _catalog_task = asyncio.create_task(worker(), name="mongo-catalog-save")

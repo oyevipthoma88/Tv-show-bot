@@ -14,6 +14,7 @@ from config import (
     FIRST_DAY_FREE, DAILY_FREE, REFERRAL_REWARDS,
 )
 from db import db
+from episode import parse_episode
 
 QUALITY_PATTERNS = [
     (r"\b(2160p|4k|uhd)\b", "2160p"),
@@ -36,7 +37,7 @@ LANG_PATTERNS = [
 
 JUNK = [
     r"@\w+", r"https?://\S+", r"\bwww\.\S+", r"\b(x264|x265|hevc|avc|aac|ddp?5\.1|10bit|esub[s]?)\b",
-    r"\b(download|movie|full|watch|link|join|telegram|channel)\b",
+    r"\b(download|movie|full|watch|link|join|telegram|channel|episode|episodes|serial|written update)\b",
     r"[\[\]\(\)\{\}_|•·—–~*#]",
 ]
 
@@ -49,6 +50,9 @@ def parse_caption(caption: str) -> dict:
     raw = (caption or "").strip()
     text = raw.replace("\n", " ")
     low = text.lower()
+    # TV captions: pull out season/episode/air-date first so the show name stays clean.
+    ep = parse_episode(raw)
+    title_source = ep["cleaned"] or text
 
     quality = ""
     for pat, label in QUALITY_PATTERNS:
@@ -63,10 +67,10 @@ def parse_caption(caption: str) -> dict:
     language = ", ".join(l.title() for l in LANG_PATTERNS if l in low)
     size_m = SIZE_RE.search(text)
     size = size_m.group(1).upper() if size_m else ""
-    year_m = YEAR_RE.search(text)
+    year_m = YEAR_RE.search(title_source)
     year = year_m.group(1) if year_m else ""
 
-    title = text
+    title = title_source
     if year:
         title = title.split(year)[0]
     title = re.sub(r"\b(s\d{1,2}\s?e\d{1,2})\b.*", "", title, flags=re.I)
@@ -89,6 +93,9 @@ def parse_caption(caption: str) -> dict:
         "quality": quality,
         "language": language,
         "size": size,
+        "season": ep["season"],
+        "episode": ep["episode"],
+        "air_date": ep["air_date"],
     }
 
 
@@ -138,6 +145,9 @@ async def search_movies(query: str, limit: int = 20, content_type: str = "") -> 
     """Return exact/strong title matches; avoid broad fuzzy matches for short queries."""
     # Only records linked to a MAIN_DATA post are deliverable. This prevents
     # stale source-channel rows from appearing and then failing on tap.
+    wanted = parse_episode(query)
+    if (wanted["episode"] or wanted["season"] or wanted["air_date"]) and wanted["cleaned"]:
+        query = wanted["cleaned"]
     q_norm = norm(query)
     if not q_norm:
         return []
@@ -146,11 +156,12 @@ async def search_movies(query: str, limit: int = 20, content_type: str = "") -> 
     total_count = await db.movie_count(storage_only=True)
     if total_count > 5000:
         # Try SQL pre-filter with the raw query first
-        candidates = await db.search_movies_sql(query, content_type=content_type, limit=limit)
+        sql_limit = 200 if (wanted["episode"] or wanted["air_date"]) else limit
+        candidates = await db.search_movies_sql(query, content_type=content_type, limit=sql_limit)
         if not candidates:
             # Fallback: try with normalized query tokens
             first_token = q_norm.split()[0] if q_norm.split() else q_norm
-            candidates = await db.search_movies_sql(first_token, content_type=content_type, limit=limit)
+            candidates = await db.search_movies_sql(first_token, content_type=content_type, limit=sql_limit)
         if not candidates:
             return []
         movies = candidates
@@ -179,12 +190,34 @@ async def search_movies(query: str, limit: int = 20, content_type: str = "") -> 
             scored.append((score, msg_id))
 
     if exact:
-        return newest_first([by_id[i] for _, i in exact])[:limit]
-    if not scored:
+        ranked = newest_first([by_id[i] for _, i in exact])
+    elif scored:
+        scored.sort(reverse=True)
+        best = scored[0][0]
+        ranked = newest_first([by_id[i] for score, i in scored if score >= max(82, best - 6)])
+    else:
         return []
-    scored.sort(reverse=True)
-    best = scored[0][0]
-    return newest_first([by_id[i] for score, i in scored if score >= max(82, best - 6)])[:limit]
+    return _filter_episode(ranked, wanted)[:limit]
+
+
+def _filter_episode(rows: list, wanted: dict) -> list:
+    """"Anupamaa episode 1234" / "Mirzapur S2E3" -> only that episode (if we have it)."""
+    if not (wanted["episode"] or wanted["season"] or wanted["air_date"]):
+        return rows
+    picked = []
+    for row in rows:
+        if wanted["episode"] and _row_value(row, "episode") != wanted["episode"]:
+            continue
+        if wanted["season"] and _row_value(row, "season") not in (0, wanted["season"]):
+            continue
+        if wanted["air_date"] and not wanted["episode"]:
+            try:
+                if (row["air_date"] or "") != wanted["air_date"]:
+                    continue
+            except (KeyError, IndexError):
+                continue
+        picked.append(row)
+    return picked or rows
 
 
 def _row_value(row, key: str) -> int:

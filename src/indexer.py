@@ -149,11 +149,11 @@ async def _send_approval_request(message: Message, bot: Bot) -> None:
     meta = build_meta(media, message.caption or "")
     title = meta["title"] or "Unknown title"
     caption = (
-        "🆕 <b>New source movie upload</b>\n\n"
+        "🆕 <b>New source upload</b>\n\n"
         f"Title: <b>{title}</b>\n"
         f"Quality: <code>{meta['quality'] or 'Unknown'}</code>\n"
         f"Source: <code>{message.chat.id}</code> / post <code>{message.message_id}</code>\n\n"
-        "Approve karoge to ye movie MAIN_DATA me copy/index ho jayegi."
+        "Approve karoge to ye episode MAIN_DATA me copy/index ho jayega."
     )
     markup = source_approval_kb(message.chat.id, message.message_id)
     targets = list(dict.fromkeys([*OWNER_IDS, *([LOG_CHANNEL] if LOG_CHANNEL else [])]))
@@ -218,6 +218,13 @@ async def index_new(message: Message, bot: Bot):
             )
             if inserted:
                 await request_snapshot(bot)
+                try:
+                    import alerts
+                    from snapshot import request_catalog_save
+                    await request_catalog_save()
+                    await alerts.queue_new_episode(bot, result.dest_msg_id)
+                except Exception as alert_exc:
+                    logging.warning("Episode alert queue failed: %s", alert_exc)
                 logging.info("Auto-transfer OK: '%s' -> MAIN_DATA msg %s via %s",
                              meta["title"], result.dest_msg_id, result.method)
                 await log_new_movie_added(bot, meta['title'], meta['quality'], src_chat, result.dest_msg_id, f"{result.method} via @{result.bot_username}", await db.movie_count(storage_only=True))

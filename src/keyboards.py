@@ -40,17 +40,13 @@ def force_join_kb(channels: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 def main_menu(is_owner: bool, is_admin: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(button("🎬 Movies", callback_data="get_movie", style="success"))
+    kb.row(button("📺 Search TV Show", callback_data="get_show", style="success"))
     kb.row(
-        button("📺 Web Series", callback_data="get_series"),
-        button("🎌 Anime", callback_data="get_anime"),
-    )
-    kb.row(
+        button("🆕 Latest Uploads", callback_data="latest:0"),
         button("🔥 Trending", callback_data="trending"),
-        button("🆕 Recently Added", callback_data="recent"),
     )
     kb.row(
-        button("📘 Tutorial", callback_data="tutorial"),
+        button("🔔 My Shows", callback_data="myshows"),
         button("🕘 History", callback_data="history"),
     )
     kb.row(
@@ -61,40 +57,76 @@ def main_menu(is_owner: bool, is_admin: bool = False) -> InlineKeyboardMarkup:
         button("🎁 Refer & Earn", callback_data="refer"),
         button("🎥 Watch Online", callback_data="online_player"),
     )
+    kb.row(button("📘 How to Use", callback_data="tutorial"))
     if is_owner:
-        kb.row(button("🛠 Owner Panel", callback_data="op:home"))
+        kb.row(button("🛠 Owner Panel", callback_data="op:home", style="danger"))
     elif is_admin:
         kb.row(button("➕ Add Video", callback_data="admin:addvideo"))
     return kb.as_markup()
 
 
+def _field(row, key: str, default=""):
+    """Read a column from sqlite Row / dict safely (Row has no .get)."""
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
 def _short_date(row) -> str:
     try:
-        ts = int(row["added_at"] or 0)
-    except (KeyError, IndexError, TypeError, ValueError):
+        ts = int(_field(row, "added_at", 0) or 0)
+    except (TypeError, ValueError):
         return ""
     if ts <= 0:
         return ""
     import datetime
     # IST display (UTC+5:30)
-    d = datetime.datetime.utcfromtimestamp(ts + 19800)
+    d = datetime.datetime.fromtimestamp(ts + 19800, datetime.timezone.utc)
     return d.strftime("%d %b")
 
 
-def results_kb(movies: list, query: str) -> InlineKeyboardMarkup:
+def episode_text(row) -> str:
+    from episode import episode_label
+    return episode_label(_field(row, "season", 0), _field(row, "episode", 0))
+
+
+def episode_button_label(row, with_title: bool = True) -> str:
+    """📅 29 Oct • Anupamaa • E1234 • 720p • 350MB  (fits Telegram's 64 chars)."""
+    day = _short_date(row)
+    parts = []
+    ep = episode_text(row)
+    if ep:
+        parts.append(ep)
+    quality = str(_field(row, "quality", "") or "")
+    if quality and quality.lower() != "unknown":
+        parts.append(quality.split()[0])
+    size = str(_field(row, "size", "") or "")
+    if size:
+        parts.append(size)
+    prefix = f"📅 {day} • " if day else "📺 "
+    tail = (" • " + " • ".join(parts)) if parts else ""
+    if not with_title:
+        return (prefix + " • ".join(parts or ["Episode"]))[:64]
+    title = str(_field(row, "title", "") or "Episode")
+    year = str(_field(row, "year", "") or "")
+    if year and not ep:
+        title += f" ({year})"
+    room = 64 - len(prefix) - len(tail)
+    if room < 8:
+        tail, room = "", 64 - len(prefix)
+    if len(title) > room:
+        title = title[: max(1, room - 1)] + "…"
+    return (prefix + title + tail)[:64]
+
+
+def results_kb(movies: list, query: str, extra_rows: list | None = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for m in movies:
-        label = f"📺 {m['title']}"
-        if m["year"]:
-            label += f" ({m['year']})"
-        if m["quality"]:
-            label += f" • {m['quality']}"
-        if m["size"]:
-            label += f" • {m['size']}"
-        day = _short_date(m)
-        if day:
-            label = f"📅 {day} • " + label[2:].lstrip()
-        kb.row(button(label[:64], callback_data=f"send:{m['msg_id']}", style="success"))
+        kb.row(button(episode_button_label(m), callback_data=f"send:{m['msg_id']}", style="success"))
+    for row in extra_rows or []:
+        kb.row(*row)
     kb.row(button("🏠 Home", callback_data="home"))
     return kb.as_markup()
 
@@ -157,10 +189,24 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 
 def owner_panel_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    # 📡 Live TV mirror (most used) on top
     kb.row(
-        button("🖼 Start Pic Set", callback_data="op:startpic"),
-        button("💳 QR Set", callback_data="op:qr"),
+        button("🔐 Login Account", callback_data="op:login", style="success"),
+        button("📡 Live Mirror", callback_data="op:live", style="success"),
     )
+    kb.row(
+        button("🎞 Source Channels", callback_data="op:setchannel"),
+        button("🔍 Scan Channel", callback_data="op:scan"),
+    )
+    kb.row(
+        button("⚡ Auto-Transfer", callback_data="op:autotransfer"),
+        button("🤖 Helper Bots", callback_data="op:helpers"),
+    )
+    kb.row(
+        button("📢 Broadcast", callback_data="op:broadcast"),
+        button("📊 Stats", callback_data="op:stats"),
+    )
+    # 💰 Money
     kb.row(
         button("💰 Plan Price", callback_data="op:price"),
         button("🎁 Gift Premium", callback_data="op:gift"),
@@ -170,18 +216,10 @@ def owner_panel_kb() -> InlineKeyboardMarkup:
         button("💎 Premium Users", callback_data="op:premlist"),
     )
     kb.row(
-        button("🎞 Source Channels", callback_data="op:setchannel"),
-        button("📡 Scan Movie Channel", callback_data="op:scan"),
-        button("📢 Broadcast", callback_data="op:broadcast"),
+        button("💳 QR Set", callback_data="op:qr"),
+        button("🖼 Start Pic Set", callback_data="op:startpic"),
     )
-    kb.row(
-        button("👮 Manage Admin", callback_data="op:admin"),
-        button("🔗 Verify URLs (max 5)", callback_data="op:force"),
-    )
-    kb.row(
-        button("📘 Set Tutorial", callback_data="op:tutorial"),
-        button("🎥 Watch Online Bot", callback_data="op:online"),
-    )
+    # 🎨 Look & delivery
     kb.row(
         button("📝 Caption Style", callback_data="op:caption"),
         button("🗑 Auto Delete", callback_data="op:autodelete"),
@@ -190,19 +228,19 @@ def owner_panel_kb() -> InlineKeyboardMarkup:
         button("📢 Join Channel", callback_data="op:setjoin"),
         button("🌐 Visit Channel", callback_data="op:setvisit"),
     )
+    # 👥 Access
     kb.row(
-        button("⚡ Auto-Transfer", callback_data="op:autotransfer"),
+        button("🔗 Verify URLs (max 5)", callback_data="op:force"),
+        button("👮 Manage Admin", callback_data="op:admin"),
+    )
+    kb.row(
+        button("📘 Set Tutorial", callback_data="op:tutorial"),
+        button("🎥 Watch Online Bot", callback_data="op:online"),
+    )
+    kb.row(
         button("👥 Group Mode", callback_data="op:groupmode"),
+        button("🏠 Home", callback_data="home"),
     )
-    kb.row(
-        button("🔐 Login Account", callback_data="op:login"),
-        button("📡 Live Mirror", callback_data="op:live"),
-    )
-    kb.row(
-        button("📊 Stats", callback_data="op:stats"),
-        button("🤖 Helper Bots", callback_data="op:helpers"),
-    )
-    kb.row(button("🏠 Home", callback_data="home"))
     return kb.as_markup()
 
 
@@ -223,24 +261,18 @@ def source_approval_kb(source_chat_id: int, source_message_id: int) -> InlineKey
 
 def movie_link_kb(link: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(button("⬇️ Movie Kholo / Download", url=link))
+    kb.row(button("⬇️ Episode Kholo / Download", url=link))
     kb.row(button("🏠 Home", callback_data="home"))
     return kb.as_markup()
 
 
 def browse_kb(movies: list, page: int = 0, per_page: int = 10, callback_prefix: str = "browse") -> InlineKeyboardMarkup:
-    """Paginated browse keyboard for trending/recent movie lists."""
+    """Paginated list (trending / latest) with 📅 date + episode on every button."""
     kb = InlineKeyboardBuilder()
-    start = page * per_page
+    start = max(0, page) * per_page
     end = min(start + per_page, len(movies))
     for m in movies[start:end]:
-        label = f"🎬 {m['title']}"
-        if m.get("year"):
-            label += f" ({m['year']})"
-        label += f" • {m.get('quality', '') or 'HD'}"
-        if m.get("size"):
-            label += f" • {m['size']}"
-        kb.row(button(label[:64], callback_data=f"send:{m['msg_id']}", style="success"))
+        kb.row(button(episode_button_label(m), callback_data=f"send:{m['msg_id']}", style="success"))
     nav = []
     if page > 0:
         nav.append(button("⬅️ Prev", callback_data=f"{callback_prefix}:{page - 1}"))

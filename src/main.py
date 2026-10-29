@@ -12,6 +12,7 @@ import indexer
 import login_handlers
 import userbot
 import owner_handlers
+import show_handlers
 import user_handlers
 from config import (BOT_TOKEN, LOG_CHANNEL, TRANSFER_MODE, TRANSFER_CONCURRENCY,
                     CATALOG_MIGRATION_RETRY_DELAY, CATALOG_MIGRATION_TIMEOUT, CATALOG_SAVE_INTERVAL,
@@ -49,6 +50,10 @@ async def main() -> None:
     # Restored state can carry old plan rows; realign labels/badges (and reset
     # prices only when the pricing revision changed).
     await db.sync_plan_catalog()
+    # Rows restored from older backups get season/episode/show grouping filled in.
+    filled = await db.backfill_show_keys()
+    if filled:
+        logging.info("TV grouping filled for %s restored episodes", filled)
     await userbot.load_saved_credentials()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     legacy_migration_task = None
@@ -179,10 +184,10 @@ async def main() -> None:
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Open main menu"),
-                BotCommand(command="movie", description="Search movies"),
-                BotCommand(command="series", description="Search web series"),
-                BotCommand(command="anime", description="Search anime"),
-                BotCommand(command="request", description="Request a movie"),
+                BotCommand(command="show", description="Search a TV show"),
+                BotCommand(command="latest", description="Latest uploaded episodes"),
+                BotCommand(command="myshows", description="Followed shows & alerts"),
+                BotCommand(command="request", description="Request a show"),
                 BotCommand(command="stats", description="Your usage stats"),
                 BotCommand(command="myplan", description="Check premium status"),
                 BotCommand(command="help", description="Show bot commands"),
@@ -207,6 +212,7 @@ async def main() -> None:
     dp.include_router(indexer.router)
     dp.include_router(login_handlers.router)
     dp.include_router(owner_handlers.router)
+    dp.include_router(show_handlers.router)
     dp.include_router(user_handlers.router)
     logging.info("Telegram bot started")
     scan_task = None

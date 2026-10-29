@@ -2,13 +2,22 @@
 
 [![Deploy on Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/oyevipthoma88/Tv-show-bot)
 
-Telegram movies bot — force-join verify, fuzzy movie search from your channel, free/premium limits, UPI payments with owner approval, referral rewards aur full owner panel.
+Telegram TV show bot — non-admin channel se **live mirror**, har naya episode turant MAIN_DATA me, users ko **sabse naya episode sabse upar 📅 date ke saath**, show follow karke **new-episode alert**, force-join verify, free/premium limits, UPI payments aur full owner panel.
+
+## 📺 TV Features (new)
+
+- **Season / Episode detection** — `Anupamaa 28th October 2026 Episode 1234`, `Mirzapur S03E05`, `Taarak Mehta 4570 28.10.2026` sab samajh aata hai; show name clean rehta hai
+- **Specific episode search** — `Anupamaa episode 1234` / `Mirzapur S2E3` bhejo, sirf wahi episode
+- **Results** — `📅 29 Oct • Anupamaa • E1234 • 720p • 350MB`, sabse naya upar + **📂 Saare Episodes** + **🔔 Follow**
+- **🆕 Latest Uploads** — aaj kitne naye episodes + saare uploads newest-first (pages)
+- **🔔 My Shows / New Episode Alert** — follow kiye show ka naya episode aate hi ek message (burst me bhi ek hi message per show)
+- **Owner Panel dashboard** — users, episodes, last-24h uploads, login status, live mirror status ek nazar me
 
 ## Features
 
 **Users**
 - Start → maximum **5 must-join channels/URLs** + **Verify** button (verify hone par hi panel milega)
-- 🎬 **Get Movie** — naam type karo (galat spelling chalega) ya 🎤 voice note bhejo; DM aur group dono me plain movie name se direct search hoti hai
+- 📺 **Search TV Show** — naam type karo (galat spelling chalega) ya 🎤 voice note bhejo; DM aur group dono me plain movie name se direct search hoti hai
 - Saare matching results quality/size ke saath buttons me; tap karte hi file channel se aa jati hai
 - 📘 Tutorial, 🕘 Last History, 🎥 Watch Online, 💎 Premium, 🎟 Redeem Coupon, 🎁 Refer & Earn
 - Free plan: pehle din **3 search**, uske baad **roz 1**

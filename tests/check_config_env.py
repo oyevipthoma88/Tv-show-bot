@@ -17,7 +17,7 @@ code = "import config; print(config.TRANSFER_CONCURRENCY, config.TRANSFER_MODE, 
 result = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True)
 if result.returncode != 0:
     raise SystemExit(result.stderr)
-expected = "10 auto 3 0 [-1001, -1002, -1003]"
+expected = "30 auto 3 0 [-1001, -1002, -1003]"  # config default concurrency is 30
 if result.stdout.strip() != expected:
     raise SystemExit(f"unexpected config output: {result.stdout!r}")
 print("config environment regression check passed")

@@ -42,14 +42,10 @@ from utils import (get_movie_channel, apply_referral_rewards, check_quota,
 
 router = Router()
 
-DEFAULT_CAPTION_TEMPLATE = (
-    "🎬 <b>𝐌𝐨𝐯𝐢𝐞 :</b> {movie_name}\n\n"
-    "🎥 <b>𝐐𝐮𝐚𝐥𝐢𝘁𝘆 :</b> {quality}\n"
-    "⏱️ <b>𝐃𝐮𝐫𝐚𝐭𝐢𝐨𝐧 :</b> {duration}\n\n"
-    "📢 <b>𝐉𝐨𝐢𝐧 :</b> {join}\n"
-    "🌐 <b>𝐕𝐢𝐬𝐢𝐭 :</b> {username}\n\n"
-    "⚡ <b>𝐄𝐧𝐣𝐨𝐲 𝐘𝐨𝐮𝐫 𝐌𝐨𝐯𝐢𝐞!</b> 🍿"
-)
+from db import DEFAULT_CAPTION_TEMPLATE  # noqa: E402  (TV show caption)
+from episode import pretty_date  # noqa: E402
+from keyboards import _short_date, episode_text  # noqa: E402
+from show_handlers import follow_rows  # noqa: E402
 
 
 class Flow(StatesGroup):
@@ -173,7 +169,12 @@ def _expiry_label(minutes: int) -> str:
 
 
 async def format_movie_caption(bot: Bot, movie) -> str:
-    title = escape(str(movie["title"] or "Movie"))
+    title = escape(str(movie["title"] or "Show"))
+    try:
+        episode_value = episode_text(movie) or "-"
+        date_value = pretty_date(movie["air_date"] or "") or _short_date(movie) or "-"
+    except (KeyError, IndexError):
+        episode_value, date_value = "-", "-"
     quality = escape(str(movie["quality"] or "Unknown"))
     duration = escape(str(movie["duration"] or "Unknown"))
     try:
@@ -195,6 +196,8 @@ async def format_movie_caption(bot: Bot, movie) -> str:
         "{join}": escape(join),
         "{username}": escape(username or "-"),
         "{extra}": escape(extra),
+        "{episode}": escape(episode_value),
+        "{date}": escape(date_value),
     }
     caption = template
     for token, replacement in values.items():
@@ -206,7 +209,7 @@ async def format_movie_caption(bot: Bot, movie) -> str:
     if 1 <= auto_delete_minutes <= 1440:
         caption += (
             f"\n\n⚠️ <b>Security:</b> Ye content {_expiry_label(auto_delete_minutes)} me auto-delete hoga. "
-            "Movie milte hi save/forward kar lo."
+            "Episode milte hi save/forward kar lo."
         )
     return caption[:1024]
 
@@ -216,32 +219,28 @@ async def send_home(target: Optional[Message], bot: Bot, user_id: int) -> None:
     if not user:
         return
     if is_premium(user):
-        status = f"💎 Premium ({human_left(user['premium_until'])})"
+        status = f"💎 Premium • {human_left(user['premium_until'])} left"
     else:
         first_day = not bool(user["first_bonus_used"])
-        status = "🆓 Free plan • Day 1: up to 3 movies" if first_day else "🆓 Free plan • 1 movie per day"
+        status = "🆓 Free • Aaj 3 episodes free" if first_day else "🆓 Free • Roz 1 episode free"
     try:
         bot_profile = await _get_bot_me(bot)
-        bot_name = escape(bot_profile["first_name"] or bot_profile["username"] or "this bot")
+        bot_name = escape(bot_profile["first_name"] or bot_profile["username"] or "TV Show Bot")
     except Exception:
-        bot_name = "this bot"
-    suggestions = await db.popular_movies("movie", 3)
-    if len(suggestions) < 3:
-        existing = {str(row["msg_id"]) for row in suggestions}
-        for row in await db.recent_movies("movie", 3, storage_only=True):
-            if str(row["msg_id"]) not in existing:
-                suggestions.append(row)
-    suggestion_text = ", ".join(str(row["title"] or "Movie") for row in suggestions[:3])
-    suggestion_line = f"🔥 Try these: <b>{escape(suggestion_text)}</b>\n\n" if suggestion_text else ""
+        bot_name = "TV Show Bot"
+    fresh = await db.latest_show_titles(3)
+    fresh_line = f"🔥 <b>Abhi aaye:</b> {escape(', '.join(fresh))}\n\n" if fresh else ""
     text = (
-        f"👋 <b>Welcome to {bot_name}</b>\n\n"
+        f"📺 <b>Welcome to {bot_name}</b>\n"
+        "━━━━━━━━━━━━━━\n"
         f"<b>{status}</b>\n\n"
-        "🎬 <b>Search any movie by name</b> — spelling mistakes welcome!\n"
-        "⚡ Instant delivery • 🎥 Watch Online • 🔥 Trending picks\n\n"
-        f"{suggestion_line}"
-        "🎁 <b>Free plan:</b> Day 1 = 3 movies, then 1 daily.\n"
-        "💎 <b>Premium:</b> Unlimited movies, no daily limit.\n\n"
-        "👇 Movie ka naam seedha bhejo ya button choose karo."
+        "🔎 Kisi bhi <b>TV show</b> ka naam bhejo — spelling galat bhi chalega\n"
+        "🆕 Har naya episode upload hote hi yahan milta hai\n"
+        "📅 Sabse naya episode hamesha <b>sabse upar</b>, date ke saath\n"
+        "🔔 Show follow karo — naya episode aate hi alert\n\n"
+        f"{fresh_line}"
+        "💎 <b>Premium:</b> Unlimited episodes, koi daily limit nahi\n\n"
+        "👇 Show ka naam bhejo ya button chuno"
     )
     pic = await db.get("start_pic", "")
     kb = main_menu(user_id in OWNER_IDS, user_id in await db.admins())
@@ -330,6 +329,19 @@ async def home(cb: CallbackQuery, bot: Bot, state: FSMContext):
     await send_home(cb.message, bot, cb.from_user.id)
 
 
+@router.callback_query(F.data == "get_show")
+async def get_show(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    await cb.answer()
+    await log_callback(bot, cb.from_user, "get_show", "Opened TV show search")
+    await begin_catalog_search(cb.message, bot, state, cb.from_user.id, "")
+
+
+@router.message(Command("show"))
+async def show_command(message: Message, bot: Bot, state: FSMContext):
+    await log_command(bot, message.from_user, "show", (message.text or "").partition(" ")[2])
+    await catalog_command(message, bot, state, "")
+
+
 @router.callback_query(F.data == "get_movie")
 async def get_movie(cb: CallbackQuery, bot: Bot, state: FSMContext):
     await cb.answer()
@@ -362,8 +374,10 @@ async def begin_catalog_search(target: Message, bot: Bot, state: FSMContext, use
     await state.set_state(Flow.searching)
     await state.update_data(content_type=content_type)
     await target.answer(
-        f"{catalog_label(content_type)} ka naam bhejo (spelling galat ho to bhi chalega).\n"
-        "🎤 Voice note bhi bhej sakte ho."
+        f"🔎 <b>{catalog_label(content_type)} ka naam bhejo</b>\n\n"
+        "• Spelling galat ho to bhi chalega\n"
+        "• Specific episode: <code>Anupamaa episode 1234</code> / <code>Mirzapur S2E3</code>\n"
+        "• 🎤 Voice note bhi bhej sakte ho"
     )
 
 
@@ -404,7 +418,7 @@ async def admin_addvideo_button(cb: CallbackQuery, state: FSMContext):
         return
     await cb.answer()
     await state.set_state(Flow.addvideo)
-    await cb.message.answer("➕ Configured movie channel ka video yahan forward karo.\n/cancel se cancel kar sakte ho.", reply_markup=admin_panel_kb())
+    await cb.message.answer("➕ Configured source channel ka video yahan forward karo.\n/cancel se cancel kar sakte ho.", reply_markup=admin_panel_kb())
 
 
 @router.message(Command("addvideo"))
@@ -413,7 +427,7 @@ async def admin_addvideo_command(message: Message, bot: Bot, state: FSMContext):
         return
     await log_command(bot, message.from_user, "addvideo")
     await state.set_state(Flow.addvideo)
-    await message.answer("➕ Configured movie channel ka video yahan forward karo.\n/cancel se cancel kar sakte ho.", reply_markup=admin_panel_kb())
+    await message.answer("➕ Configured source channel ka video yahan forward karo.\n/cancel se cancel kar sakte ho.", reply_markup=admin_panel_kb())
 
 
 @router.message(Flow.addvideo)
@@ -441,15 +455,16 @@ async def admin_addvideo(message: Message, bot: Bot, state: FSMContext):
 async def help_command(message: Message, bot: Bot):
     await log_command(bot, message.from_user, "help")
     await message.answer(
-        "📘 <b>Commands</b>\n\n"
-        "/movie [name] — movie search\n"
-        "/series [name] — web series search\n"
-        "/anime [name] — anime search\n"
-        "/myplan — premium status\n"
-        "/cancel — active search cancel\n"
-        "/request [name] — movie request\n"
-        "/stats — your usage stats\n\n"
-        "🎁 Free users: first day 3 movies, then 1 movie per day."
+        "📘 <b>Commands</b>\n━━━━━━━━━━━━━━\n"
+        "/show [name] — TV show search\n"
+        "/latest — 🆕 latest uploads\n"
+        "/myshows — 🔔 followed shows\n"
+        "/myplan — 💎 premium status\n"
+        "/request [name] — show request\n"
+        "/stats — tumhara usage\n"
+        "/cancel — active search cancel\n\n"
+        "💡 Seedha show ka naam bhejo, jaise <code>Anupamaa</code> ya <code>Anupamaa episode 1234</code>\n"
+        "🎁 Free: pehle din 3 episodes, phir roz 1."
     )
 
 
@@ -457,7 +472,7 @@ async def help_command(message: Message, bot: Bot):
 async def cancel_command(message: Message, bot: Bot, state: FSMContext):
     await log_command(bot, message.from_user, "cancel")
     await state.clear()
-    await message.answer("Active search cancel ho gaya. Naya search /movie se start karo.")
+    await message.answer("Active search cancel ho gaya. Show ka naam seedha bhejo ya /show use karo.")
 
 
 @router.message(Flow.searching, F.voice | F.audio)
@@ -471,7 +486,7 @@ async def voice_search(message: Message, bot: Bot, state: FSMContext):
         text = await transcribe_voice(path)
         if not text:
             await log_voice_search(bot, message.from_user, failed=True)
-            await note.edit_text("Voice samajh nahi aayi 😕 Movie ka naam type karke bhejo.")
+            await note.edit_text("Voice samajh nahi aayi 😕 Show ka naam type karke bhejo.")
             return
         await log_voice_search(bot, message.from_user, text)
         await note.edit_text(f"🔎 Suna: <b>{escape(text)}</b>")
@@ -479,7 +494,7 @@ async def voice_search(message: Message, bot: Bot, state: FSMContext):
     except Exception:
         logging.exception("Voice search failed for %s", message.from_user.id)
         await log_voice_search(bot, message.from_user, failed=True)
-        await note.edit_text("Voice process nahi ho payi 😕 Movie ka naam type karke bhejo.")
+        await note.edit_text("Voice process nahi ho payi 😕 Show ka naam type karke bhejo.")
     finally:
         try:
             os.unlink(path)
@@ -494,8 +509,8 @@ async def text_search(message: Message, bot: Bot, state: FSMContext):
 
 @router.message(F.chat.type == ChatType.PRIVATE, F.text, ~F.text.startswith("/"))
 async def direct_dm_search(message: Message, bot: Bot, state: FSMContext):
-    """Search any plain DM text without requiring the Movies button first."""
-    await state.update_data(content_type="movie")
+    """Search any plain DM text without requiring a button first (all shows)."""
+    await state.update_data(content_type="")
     await do_search(message, message.text.strip(), state, bot)
 
 
@@ -521,7 +536,7 @@ async def direct_group_search(message: Message, bot: Bot, state: FSMContext):
     query = (message.text or "").replace(username, "").strip() if is_mentioned else (message.text or "").strip()
     if not query:
         return
-    await state.update_data(content_type="movie")
+    await state.update_data(content_type="")
     await log_group_search(bot, message.from_user, message.chat.id, query, 0)
     await do_search(message, query, state, bot)
 
@@ -535,7 +550,7 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
     pending = await not_joined(effective_bot, message.from_user.id)
     if pending:
         await message.answer(
-            "🔒 Required channel leave ho gaya hai. Movie search/delivery ke liye pehle join karo aur Verify dabao.",
+            "🔒 Required channel leave ho gaya hai. Show search/delivery ke liye pehle join karo aur Verify dabao.",
             reply_markup=force_join_kb(pending),
         )
         return
@@ -573,18 +588,18 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
                     _rows.append(_d)
             _btns = []
             for _r in _rows[:10]:
-                title = (_r.get('title') or 'Movie')[:60]
+                title = (_r.get('title') or 'Episode')[:60]
                 _ch_id = _r.get('channel_id', STORAGE_CHANNEL)
                 _btns.append([InlineKeyboardButton(
-                    text=f"🎬 {title}",
+                    text=f"📺 {title}",
                     callback_data=f"directdl:{_ch_id}:{_r.get('msg_id')}"
                 )])
             _support_url = await db.get("support_url", "") or SUPPORT_URL
             if _support_url:
-                _btns.append([InlineKeyboardButton(text="📞 Support / Request Movie", url=_support_url)])
+                _btns.append([InlineKeyboardButton(text="📞 Support / Request Show", url=_support_url)])
             _btns.append([InlineKeyboardButton(text="🏠 Home", callback_data="home")])
             await message.answer(
-                f"✅ <b>{escape(query)}</b> ke liye {len(_rows)} results mile!\nMovie select karo 👇",
+                f"✅ <b>{escape(query)}</b> ke liye {len(_rows)} results mile!\nEpisode select karo 👇",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=_btns)
             )
             return
@@ -593,8 +608,7 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
         suggestion_text = ""
         suggestion_markup = None
         if suggestions:
-            names = ", ".join(str(row["title"] or "Movie") for row in suggestions[:5])
-            suggestion_text = f"\n\n✅ Ye movies abhi available hain: <b>{escape(names)}</b>\nInme se kisi button ko tap karke movie le sakte ho:"
+            suggestion_text = "\n\n🆕 <b>Abhi ke latest uploads</b> — tap karke le sakte ho:"
             suggestion_markup = results_kb(suggestions, query)
         support_url = await db.get("support_url", "") or SUPPORT_URL
         
@@ -607,13 +621,13 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
         if suggestion_markup:
             kb_rows.extend(suggestion_markup.inline_keyboard)
         if support_url:
-            kb_rows.append([InlineKeyboardButton(text="📞 Support / Request Movie", url=support_url)])
+            kb_rows.append([InlineKeyboardButton(text="📞 Support / Request Show", url=support_url)])
         kb_rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="home")])
         final_markup = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
         
         await message.answer(
-            f"❌ <b>{escape(query)}</b> naam ki {catalog_label(content_type).lower()} abhi available nahi hai.\n"
-            "Movie request karne ke liye neeche Support button dabao."
+            f"😕 <b>{escape(query)}</b> abhi available nahi hai.\n"
+            "Naya episode aate hi Latest Uploads me dikhega. Request ke liye /request ya Support button dabao."
             + spelling_msg
             + suggestion_text,
             reply_markup=final_markup,
@@ -621,12 +635,24 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
         await log_not_found(effective_bot, message.from_user, query, content_type, corrected or "")
         return
     await state.update_data(last_query=query, content_type=content_type)
-    top = f"{results[0]['title']} (msg {results[0]['msg_id']})" if results else ""
-    await log_search(effective_bot, message.from_user, query, len(results), content_type, top)
+    top_label = f"{results[0]['title']} (msg {results[0]['msg_id']})" if results else ""
+    await log_search(effective_bot, message.from_user, query, len(results), content_type, top_label)
+    top = results[0]
+    try:
+        top_key = top["show_key"] or ""
+    except (KeyError, IndexError):
+        top_key = ""
+    extra = []
+    if top_key:
+        total_eps = await db.show_episode_count(top_key)
+        following = await db.is_following(message.from_user.id, top_key)
+        extra = follow_rows(top, following, total_eps, len(results))
     await message.answer(
-        f"🔎 <b>{escape(query)}</b> — {len(results)} result(s) mile!\n"
-        "👇 Quality dekh kar movie select karo:",
-        reply_markup=results_kb(results, query),
+        f"🔎 <b>{escape(query)}</b> — {len(results)} result(s)\n"
+        "━━━━━━━━━━━━━━\n"
+        "📅 Sabse naya episode sabse upar hai\n"
+        "👇 Tap karo, file turant aayegi",
+        reply_markup=results_kb(results, query, extra_rows=extra),
     )
 
 
@@ -635,12 +661,12 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
     try:
         msg_id = int(cb.data.split(":")[1])
     except (IndexError, ValueError):
-        await cb.message.answer("⚠️ Invalid movie link. Dobara search karo.")
+        await cb.message.answer("⚠️ Invalid episode link. Dobara search karo.")
         return
     pending = await not_joined(bot, cb.from_user.id)
     if pending:
         await cb.message.answer(
-            "🔒 Required channel leave ho gaya hai. Movie lene ke liye pehle join karo aur Verify dabao.",
+            "🔒 Required channel leave ho gaya hai. Episode lene ke liye pehle join karo aur Verify dabao.",
             reply_markup=force_join_kb(pending),
         )
         return
@@ -655,7 +681,7 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
         logging.exception("Movie source lookup failed: %s", exc)
     delivery_msg_id = int(movie["storage_msg_id"]) if movie["storage_msg_id"] else msg_id
     if delivery_msg_id <= 0:
-        await cb.message.answer("⚠️ Is movie ka MAIN_DATA post ID missing hai. Owner ko /scanall dobara chalana hoga.")
+        await cb.message.answer("⚠️ Is episode ka MAIN_DATA post ID missing hai. Owner ko /scanall dobara chalana hoga.")
         return
     try:
         storage_chat = await _get_storage_chat(bot)
@@ -663,7 +689,7 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
     except Exception:
         storage_info = {"id": STORAGE_CHANNEL, "username": ""}
     link = post_link(storage_info, delivery_msg_id)
-    title = movie["title"] if movie else "Movie"
+    title = movie["title"] if movie else "Episode"
     try:
         caption = await format_movie_caption(bot, movie)
     except Exception as exc:
@@ -676,7 +702,7 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
         if 1 <= fallback_minutes <= 1440:
             caption += (
                 f"\n\n⚠️ <b>Security:</b> Ye content {_expiry_label(fallback_minutes)} me auto-delete hoga. "
-                "Movie milte hi save/forward kar lo."
+                "Episode milte hi save/forward kar lo."
             )
 
     ok, why = await reserve_quota(cb.from_user.id)
@@ -756,7 +782,7 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
         kind = classify(err)
         mode = f"failed({kind})"
         await cb.message.answer(
-            "⚠️ Movie deliver nahi ho payi.\n"
+            "⚠️ Episode deliver nahi ho payi.\n"
             f"MAIN_DATA post: <code>{delivery_msg_id}</code>\n"
             f"Reason: <code>{escape(err[:500] or 'Telegram delivery failed')}</code>\n"
             "Owner ko LOG_CHANNEL error check karke bot ko MAIN_DATA me admin karna hoga."
@@ -775,8 +801,8 @@ async def _send_movie_impl(cb: CallbackQuery, bot: Bot, state: FSMContext):
             )
             try:
                 await cb.message.answer(
-                    f"⚠️ <b>Security warning:</b> Ye movie message {_expiry_label(delete_minutes)} me automatically delete ho jayega.\n"
-                    "Movie milte hi save ya forward kar lo."
+                    f"⚠️ <b>Security warning:</b> Ye episode {_expiry_label(delete_minutes)} me automatically delete ho jayega.\n"
+                    "Episode milte hi save ya forward kar lo."
                 )
             except Exception as warning_exc:
                 logging.warning("Auto-delete warning failed for %s: %s", cb.from_user.id, warning_exc)
@@ -812,13 +838,13 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         if msg_id <= 0:
             raise ValueError("invalid message id")
     except (TypeError, ValueError, IndexError):
-        await cb.answer("Invalid movie link", show_alert=True)
+        await cb.answer("Invalid episode link", show_alert=True)
         return
     await cb.answer("File bhej raha hoon…")
     pending = await not_joined(bot, cb.from_user.id)
     if pending:
         await cb.message.answer(
-            "🔒 Required channel leave ho gaya hai. Movie lene ke liye pehle join karo aur Verify dabao.",
+            "🔒 Required channel leave ho gaya hai. Episode lene ke liye pehle join karo aur Verify dabao.",
             reply_markup=force_join_kb(pending),
         )
         return
@@ -827,15 +853,15 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await cb.message.answer(why, reply_markup=plans_kb(await db.plans()))
         return
     try:
-        caption = "🎬 <b>Movie</b>"
+        caption = "📺 <b>Episode</b>"
         try:
             delete_minutes = int(await db.get("auto_delete_minutes", "0"))
         except (TypeError, ValueError):
             delete_minutes = 0
         if 1 <= delete_minutes <= 1440:
             caption += (
-                f"\n\n⚠️ <b>Security:</b> Ye movie message {_expiry_label(delete_minutes)} me auto-delete hoga. "
-                "Movie milte hi save ya forward kar lo."
+                f"\n\n⚠️ <b>Security:</b> Ye episode {_expiry_label(delete_minutes)} me auto-delete hoga. "
+                "Episode milte hi save ya forward kar lo."
             )
         copied = await asyncio.wait_for(
             bot.copy_message(
@@ -859,7 +885,7 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await refund_quota(cb.from_user.id)
         logging.exception("Direct download failed for %s: %s", msg_id, exc)
         await cb.message.answer(
-            "⚠️ Movie deliver nahi ho payi.\n"
+            "⚠️ Episode deliver nahi ho payi.\n"
             f"Message ID: <code>{msg_id}</code>\n"
             "Owner ko LOG_CHANNEL error check karna hoga."
         )
@@ -970,8 +996,8 @@ async def online_player(cb: CallbackQuery, bot: Bot):
         "🎥 <b>Watch Online</b>\n\n"
         f"1. <code>{escape(player_bot)}</code> ko apne group me add karke admin do.\n"
         "2. Group me voice chat start karo.\n"
-        "3. Movie post ko group me forward/tag karke <code>vplay</code> likho.\n"
-        "4. Player bot movie ko voice chat me play karega.\n\n"
+        "3. Episode post ko group me forward/tag karke <code>vplay</code> likho.\n"
+        "4. Player bot episode ko voice chat me play karega.\n\n"
         "Owner panel se player bot username set karne ke baad ye button users ko exact bot handle dikhayega."
     )
 
@@ -983,7 +1009,7 @@ async def plans(cb: CallbackQuery, bot: Bot):
     await log_callback(bot, cb.from_user, "plans", "Viewed premium plans")
     rows = await db.plans()
     text = plans_text(rows)
-    text += "\n\n✨ Unlimited movies • No daily limit • Fast delivery\n👇 Neeche apna plan choose karo:"
+    text += "\n\n✨ Unlimited episodes • No daily limit • Fast delivery\n👇 Neeche apna plan choose karo:"
     await cb.message.answer(text, reply_markup=plans_kb(rows))
 
 
@@ -1157,14 +1183,14 @@ async def request_command(message: Message, bot: Bot):
     """Formal movie request command — logs to LOG_CHANNEL for owner visibility."""
     query = (message.text or "").partition(" ")[2].strip()
     if not query:
-        await message.answer("📝 Movie request karne ke liye: <code>/request Movie Name</code>")
+        await message.answer("📝 Show request karne ke liye: <code>/request Show Name</code>")
         return
     await log_movie_request(bot, message.from_user, query)
     await db.add_audit(message.from_user.id, "request", query)
     support_url = await db.get("support_url", "") or SUPPORT_URL
     text = (
         f"✅ Tumhara request <b>{escape(query)}</b> owner ko bhej diya gaya hai.\n"
-        "Jaise hi ye movie catalog me add hogi, tumhe notify kar diya jayega."
+        "Jaise hi ye show catalog me add hoga, tumhe notify kar diya jayega."
     )
     if support_url:
         await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1197,72 +1223,49 @@ async def stats_command(message: Message, bot: Bot):
         f"👤 <b>Name:</b> {escape(message.from_user.full_name)}\n"
         f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
         f"📋 <b>Plan:</b> {premium_status}\n"
-        f"🎬 <b>Movies watched:</b> {len(history)}\n"
+        f"📺 <b>Episodes watched:</b> {len(history)}\n"
         f"📅 <b>Today's usage:</b> {used_today}/{limit if not is_premium(user) else '∞'}"
         + (f" ({remaining} left today)" if not is_premium(user) else "") + "\n"
         f"👥 <b>Referrals:</b> {user['referrals']}\n"
-        f"📚 <b>Total catalog:</b> {total_catalog} movies\n"
+        f"📚 <b>Total catalog:</b> {total_catalog} episodes\n"
     )
     if not is_premium(user) and remaining == "0":
-        text += "\n💎 Premium le lo unlimited movies ke liye!"
+        text += "\n💎 Premium le lo unlimited episodes ke liye!"
     await message.answer(text, reply_markup=plans_kb(await db.plans()) if not is_premium(user) else InlineKeyboardMarkup(inline_keyboard=[[button("🏠 Home", callback_data="home")]]))
 
 
 @router.callback_query(F.data == "trending")
 async def trending_movies(cb: CallbackQuery, bot: Bot):
-    """Show most popular movies based on delivery history."""
+    """Most watched shows/episodes based on delivery history."""
     await cb.answer()
-    await log_callback(bot, cb.from_user, "trending", "Viewed trending movies")
-    movies = await db.popular_movies("movie", 30)
+    await log_callback(bot, cb.from_user, "trending", "Viewed trending shows")
+    movies = await db.popular_movies("", 30)
     if not movies:
-        await cb.message.answer("🔥 Abhi koi trending data nahi hai. Movies dekhne par yahan dikhengi.")
+        await cb.message.answer(
+            "🔥 Abhi trending data nahi hai. Log episodes dekhenge to yahan dikhenge.\n"
+            "Tab tak 🆕 Latest Uploads dekho 👇",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("🆕 Latest Uploads", callback_data="latest:0")],
+                                                               [button("🏠 Home", callback_data="home")]]),
+        )
         return
-    text = f"🔥 <b>Trending Movies</b>\n\nTop {len(movies)} most watched movies:\nTap karo aur seedha le lo 👇"
+    text = f"🔥 <b>Trending Shows</b>\n━━━━━━━━━━━━━━\nTop {len(movies)} sabse zyada dekhe gaye episodes 👇"
     await cb.message.answer(text, reply_markup=browse_kb(movies, page=0, callback_prefix="trending"))
 
 
 @router.callback_query(F.data.startswith("trending:"))
 async def trending_page(cb: CallbackQuery, bot: Bot):
-    """Pagination for trending movies."""
+    """Pagination for trending."""
     await cb.answer()
     try:
-        page = int(cb.data.split(":")[1])
-        if page < 0:
-            page = 0
+        page = max(0, int(cb.data.split(":")[1]))
     except (IndexError, ValueError):
         page = 0
-    movies = await db.popular_movies("movie", 30)
-    await cb.message.edit_text(
-        f"🔥 <b>Trending Movies</b>\n\nPage {page + 1}\nTap karo aur seedha le lo 👇",
-        reply_markup=browse_kb(movies, page=page, callback_prefix="trending"),
-    )
-
-
-@router.callback_query(F.data == "recent")
-async def recent_movies_cb(cb: CallbackQuery, bot: Bot):
-    """Show recently added movies from catalog."""
-    await cb.answer()
-    await log_callback(bot, cb.from_user, "recent", "Viewed recently added movies")
-    movies = await db.recent_movies("movie", 30, storage_only=True)
-    if not movies:
-        await cb.message.answer("🆕 Abhi catalog me koi movie nahi hai. Owner ko /scanall chalane ko bolo.")
-        return
-    text = f"🆕 <b>Recently Added Movies</b>\n\nLatest {len(movies)} movies from catalog:\nTap karo aur seedha le lo 👇"
-    await cb.message.answer(text, reply_markup=browse_kb(movies, page=0, callback_prefix="recent"))
-
-
-@router.callback_query(F.data.startswith("recent:"))
-async def recent_page(cb: CallbackQuery, bot: Bot):
-    """Pagination for recently added movies."""
-    await cb.answer()
+    movies = await db.popular_movies("", 30)
     try:
-        page = int(cb.data.split(":")[1])
-        if page < 0:
-            page = 0
-    except (IndexError, ValueError):
-        page = 0
-    movies = await db.recent_movies("movie", 30, storage_only=True)
-    await cb.message.edit_text(
-        f"🆕 <b>Recently Added Movies</b>\n\nPage {page + 1}\nTap karo aur seedha le lo 👇",
-        reply_markup=browse_kb(movies, page=page, callback_prefix="recent"),
-    )
+        await cb.message.edit_text(
+            f"🔥 <b>Trending Shows</b>\n━━━━━━━━━━━━━━\nPage {page + 1} 👇",
+            reply_markup=browse_kb(movies, page=page, callback_prefix="trending"),
+        )
+    except Exception:
+        pass
+

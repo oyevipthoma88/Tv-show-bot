@@ -28,6 +28,9 @@ _queue: asyncio.Queue | None = None
 _worker: asyncio.Task | None = None
 _catchup: asyncio.Task | None = None
 _me_label = ""
+_watchdog: asyncio.Task | None = None
+_bot_admin_cache: dict[int, tuple[bool, float]] = {}
+_last_alert: dict[str, float] = {}
 
 
 # ---------------- credentials ----------------
@@ -267,6 +270,35 @@ async def _send_to_main(client, message):
     return None
 
 
+async def _notify_owner(reason_key: str, text: str) -> None:
+    """Tell the owner about live-mirror problems (max once per 10 min per reason)."""
+    if _live_bot is None or time.time() - _last_alert.get(reason_key, 0) < 600:
+        return
+    _last_alert[reason_key] = time.time()
+    for owner in config.OWNER_IDS:
+        try:
+            await _live_bot.send_message(owner, text)
+        except Exception:
+            pass
+
+
+async def _bot_handles(chat_id: int) -> bool:
+    """Skip channels where the bot itself is admin — the bot's own auto-transfer
+    already copies those, so mirroring them here would create duplicates."""
+    if _live_bot is None:
+        return False
+    cached = _bot_admin_cache.get(chat_id)
+    if cached and time.time() - cached[1] < 600:
+        return cached[0]
+    try:
+        member = await _live_bot.get_chat_member(chat_id, _live_bot.id)
+        admin = getattr(member, "status", "") in ("administrator", "creator")
+    except Exception:
+        admin = False
+    _bot_admin_cache[chat_id] = (admin, time.time())
+    return admin
+
+
 async def _process(message) -> None:
     client = _live_client
     document = getattr(message, "document", None)
@@ -275,32 +307,48 @@ async def _process(message) -> None:
     caption = message.message or ""
     key = f"tg:{document.id}:{getattr(document, 'access_hash', 0) or 0}"
     chat_id = message.chat_id
-    if await db.has_duplicate_movie(key, caption):
+    source_meta = _doc_meta(document, caption)
+    if await db.has_duplicate_upload(key, caption, source_meta.get("size", "")):
         log.info("Live mirror: duplicate %s/%s skipped", chat_id, message.id)
         await db.set(f"live_last:{chat_id}", str(message.id))
         return
-    sent = await _send_to_main(client, message)
+    try:
+        sent = await _send_to_main(client, message)
+    except Exception as exc:
+        log.error("Live mirror: share %s/%s failed: %s", chat_id, message.id, exc)
+        await _notify_owner(
+            "share_failed",
+            "⚠️ <b>Live Mirror: upload MAIN_DATA me nahi gaya</b>\n\n"
+            f"Error: <code>{str(exc)[:300]}</code>\n\n"
+            "Check karo: login wala account MAIN_DATA channel me <b>admin</b> ho (post permission) "
+            "aur source channel join kiya ho.",
+        )
+        return
     if not sent:
         log.error("Live mirror: failed to share %s/%s", chat_id, message.id)
         return
     sent_doc = getattr(sent, "document", None) or document
     file_key = f"tg:{sent_doc.id}:{getattr(sent_doc, 'access_hash', 0) or 0}"
     meta = _doc_meta(sent_doc, caption)
+    posted_at = int(message.date.timestamp()) if getattr(message, "date", None) else int(time.time())
     inserted = await db.upsert_movie(
         sent.id, meta["title"], meta["year"], meta["quality"], meta["language"], meta["size"],
         caption, file_key, meta["file_type"], detect_content_type(caption),
-        duration=meta["duration"], storage_msg_id=sent.id,
+        duration=meta["duration"], storage_msg_id=sent.id, added_at=posted_at,
     )
     await db.set(f"live_last:{chat_id}", str(message.id))
     if inserted and _live_bot is not None:
         try:
-            from snapshot import request_snapshot
+            from snapshot import request_catalog_save, request_snapshot
             await request_snapshot(_live_bot)
+            await request_catalog_save()
+            import alerts
+            await alerts.queue_new_episode(_live_bot, sent.id)
             from log_helper import log_new_movie_added
             await log_new_movie_added(_live_bot, meta["title"], meta["quality"], chat_id, sent.id,
                                       "live mirror (user account)", await db.movie_count(storage_only=True))
         except Exception as exc:
-            log.warning("Live mirror log failed: %s", exc)
+            log.warning("Live mirror post-index step failed: %s", exc)
     log.info("Live mirror: %s/%s -> MAIN_DATA %s (%s)", chat_id, message.id, sent.id, meta["title"])
 
 
@@ -348,6 +396,7 @@ async def start_live(bot) -> bool:
     _live_bot = bot
     if _live_client is not None or not (has_api() and config.TG_SESSION):
         return is_live()
+    _ensure_watchdog()  # keeps retrying even if this first connect fails
     from telethon import events
     client = _new_client(config.TG_SESSION)
     try:
@@ -372,21 +421,55 @@ async def start_live(bot) -> bool:
         if not getattr(msg, "document", None):
             return
         chat = await event.get_chat()
-        if await _is_source(event.chat_id, getattr(chat, "username", "") or ""):
-            await _queue.put(msg)
+        if not await _is_source(event.chat_id, getattr(chat, "username", "") or ""):
+            return
+        if await _bot_handles(event.chat_id):
+            return
+        await _queue.put(msg)
 
     client.add_event_handler(on_new, events.NewMessage())
     _live_client = client
     _queue = asyncio.Queue()
     _worker = asyncio.create_task(_run_worker(), name="live-mirror-worker")
     _catchup = asyncio.create_task(_catch_up(), name="live-mirror-catchup")
+    _ensure_watchdog()
     log.info("Live mirror started as %s", _me_label)
     return True
 
 
-async def stop_live() -> None:
-    global _live_client, _worker, _catchup
-    for task in (_catchup, _worker):
+def _ensure_watchdog() -> None:
+    global _watchdog
+    if _watchdog is None or _watchdog.done():
+        _watchdog = asyncio.create_task(_watch(), name="live-mirror-watchdog")
+
+
+async def _watch() -> None:
+    """Reconnect the live account automatically if Telegram drops the connection."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if _live_bot is None or not (has_api() and config.TG_SESSION):
+                continue
+            if _live_client is not None and _live_client.is_connected():
+                continue
+            log.warning("Live mirror disconnected — reconnecting")
+            await stop_live(keep_watchdog=True)
+            if not await start_live(_live_bot):
+                await _notify_owner("reconnect_failed",
+                                    "⚠️ <b>Live Mirror band ho gaya</b>\nAccount reconnect nahi hua. "
+                                    "Owner Panel → 🔐 Login Account se dobara login karo.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Live mirror watchdog error: %s", exc)
+
+
+async def stop_live(keep_watchdog: bool = False) -> None:
+    global _live_client, _worker, _catchup, _watchdog
+    tasks = [_catchup, _worker] + ([] if keep_watchdog else [_watchdog])
+    if not keep_watchdog:
+        _watchdog = None
+    for task in tasks:
         if task is not None and not task.done():
             task.cancel()
     _worker = _catchup = None

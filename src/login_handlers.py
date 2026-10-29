@@ -52,10 +52,15 @@ async def login_home(cb: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await cb.message.answer(
-        "🔐 <b>Login Account</b>\n\n" + await userbot.status_text() +
-        "\n\nJis account ne source channel (non-admin) join kiya hai usse login karo. "
-        "Wo account MAIN_DATA channel me admin (post permission) hona chahiye — "
-        "naye uploads turant MAIN_DATA me share honge.",
+        "🔐 <b>Login Account</b>\n━━━━━━━━━━━━━━\n" + await userbot.status_text() +
+        "\n\n📋 <b>Steps</b>\n"
+        "1️⃣ my.telegram.org → API ID + API HASH\n"
+        "2️⃣ Phone number (<code>+91…</code>)\n"
+        "3️⃣ OTP <b>spaces ke saath</b> (<code>1 2 3 4 5</code>)\n"
+        "4️⃣ 2-Step password (agar laga hai)\n\n"
+        "⚠️ Ye account <b>source channel join</b> kiya ho (admin zaroori nahi) aur "
+        "<b>MAIN_DATA me admin</b> ho (post permission). Login ke baad naya upload aate hi "
+        "turant MAIN_DATA me aa jayega.",
         reply_markup=_login_kb(),
     )
 

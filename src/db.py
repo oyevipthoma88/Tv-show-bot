@@ -10,6 +10,41 @@ from config import (DB_PATH, DEFAULT_PLANS, MONGO_CAPTION_LIMIT, PLAN_PRICING_RE
                     DEFAULT_FORCE_CHANNELS, DEFAULT_START_PIC, DEFAULT_QR, DEFAULT_UPI,
                     DEFAULT_AUTO_DELETE_MINUTES)
 from movie_catalog import detect_content_type
+from episode import parse_episode, show_key as make_show_key
+
+LEGACY_TUTORIAL = "📘 <b>Movie Bot Tutorial</b>\n\n1. Pehle required channels join karke <b>Verify</b> dabao.\n2. <b>🎬 Movies</b> par tap karo ya DM/group me movie ka naam bhejo. Spelling thodi galat ho to bhi bot closest result dhoond lega.\n3. Result me quality aur size dekhkar movie button tap karo.\n4. Movie milte hi use save ya forward kar lo, kyunki security ke liye owner ke set kiye hue time ke baad message automatically delete ho sakta hai.\n5. Movie available na ho to bot available suggestions dikhayega.\n6. Premium, coupon aur payment ke liye menu ke respective buttons use karo.\n\n⚠️ Sirf legal aur authorised content ka use karo."
+DEFAULT_TUTORIAL = (
+    "📺 <b>TV Show Bot — Kaise use kare</b>\n\n"
+    "1️⃣ Required channels join karke <b>✅ Verify</b> dabao.\n"
+    "2️⃣ Show ka naam seedha bhejo — jaise <code>Anupamaa</code>. Spelling thodi galat bhi chalega.\n"
+    "3️⃣ Specific episode chahiye? <code>Anupamaa episode 1234</code> ya <code>Mirzapur S2E3</code> bhejo.\n"
+    "4️⃣ Results me sabse <b>naya episode sabse upar</b> 📅 date ke saath hota hai — tap karo, file turant aayegi.\n"
+    "5️⃣ <b>🆕 Latest Uploads</b> me aaj ke saare naye episodes milte hain.\n"
+    "6️⃣ <b>🔔 Follow</b> dabao — us show ka naya episode aate hi bot khud message karega.\n"
+    "7️⃣ File milte hi save/forward kar lo, kuch der baad auto-delete ho sakti hai.\n\n"
+    "⚠️ Sirf legal aur authorised content ka use karo."
+)
+LEGACY_CAPTION_TEMPLATE = "🎬 <b>𝐌𝐨𝐯𝐢𝐞 :</b> {movie_name}\n\n🎥 <b>𝐐𝐮𝐚𝐥𝐢𝐭𝐲 :</b> {quality}\n⏱️ <b>𝐃𝐮𝐫𝐚𝐭𝐢𝐨𝐧 :</b> {duration}\n\n📢 <b>𝐉𝐨𝐢𝐧 :</b> {join}\n🌐 <b>𝐕𝐢𝐬𝐢𝐭 :</b> {username}\n\n⚡ <b>𝐄𝐧𝐣𝐨𝐲 𝐘𝐨𝐮𝐫 𝐌𝐨𝐯𝐢𝐞!</b> 🍿"
+DEFAULT_CAPTION_TEMPLATE = (
+    "📺 <b>𝐒𝐡𝐨𝐰 :</b> {movie_name}\n"
+    "🎞 <b>𝐄𝐩𝐢𝐬𝐨𝐝𝐞 :</b> {episode}\n"
+    "📅 <b>𝐃𝐚𝐭𝐞 :</b> {date}\n\n"
+    "🎥 <b>𝐐𝐮𝐚𝐥𝐢𝐭𝐲 :</b> {quality}\n"
+    "⏱️ <b>𝐃𝐮𝐫𝐚𝐭𝐢𝐨𝐧 :</b> {duration}\n\n"
+    "📢 <b>𝐉𝐨𝐢𝐧 :</b> {join}\n"
+    "🌐 <b>𝐕𝐢𝐬𝐢𝐭 :</b> {username}\n\n"
+    "⚡ <b>𝐄𝐧𝐣𝐨𝐲 𝐘𝐨𝐮𝐫 𝐒𝐡𝐨𝐰!</b> 🍿"
+)
+MOVIE_COLUMNS = "msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at,season,episode,air_date,show_key"
+
+
+def episode_columns(title: str, caption: str) -> tuple[int, int, str, str]:
+    """(season, episode, air_date, show_key) for a catalog row."""
+    info = parse_episode(caption or "")
+    if not (info["season"] or info["episode"] or info["air_date"]):
+        info = parse_episode(title or "")
+    return info["season"], info["episode"], info["air_date"], make_show_key(title or "")
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -87,6 +122,16 @@ CREATE TABLE IF NOT EXISTS delivery_expiry (
     delete_at INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS follows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    show_key TEXT NOT NULL,
+    show_title TEXT,
+    at INTEGER,
+    UNIQUE (user_id, show_key)
+);
+CREATE TABLE IF NOT EXISTS episode_alerts (msg_id INTEGER PRIMARY KEY, at INTEGER);
+CREATE INDEX IF NOT EXISTS idx_follows_show ON follows (show_key);
 CREATE INDEX IF NOT EXISTS idx_history_msg_id_at ON history (msg_id, at DESC);
 CREATE INDEX IF NOT EXISTS idx_delivery_expiry_delete_at ON delivery_expiry (delete_at);
 """
@@ -119,10 +164,14 @@ class DB:
         await self.set_default("start_pic", DEFAULT_START_PIC)
         await self.set_default("qr", DEFAULT_QR)
         await self.set_default("upi", DEFAULT_UPI)
-        await self.set_default("tutorial", "📘 <b>Movie Bot Tutorial</b>\n\n1. Pehle required channels join karke <b>Verify</b> dabao.\n2. <b>🎬 Movies</b> par tap karo ya DM/group me movie ka naam bhejo. Spelling thodi galat ho to bhi bot closest result dhoond lega.\n3. Result me quality aur size dekhkar movie button tap karo.\n4. Movie milte hi use save ya forward kar lo, kyunki security ke liye owner ke set kiye hue time ke baad message automatically delete ho sakta hai.\n5. Movie available na ho to bot available suggestions dikhayega.\n6. Premium, coupon aur payment ke liye menu ke respective buttons use karo.\n\n⚠️ Sirf legal aur authorised content ka use karo.")
+        await self.set_default("tutorial", DEFAULT_TUTORIAL)
+        if (await self.get("tutorial", "")) == LEGACY_TUTORIAL:
+            await self.set("tutorial", DEFAULT_TUTORIAL)
         await self.set_default("online_player_bot", "")
         await self.set_default("verify_channels_limit", "5")
-        await self.set_default("caption_template", "🎬 <b>𝐌𝐨𝐯𝐢𝐞 :</b> {movie_name}\n\n🎥 <b>𝐐𝐮𝐚𝐥𝐢𝐭𝐲 :</b> {quality}\n⏱️ <b>𝐃𝐮𝐫𝐚𝐭𝐢𝐨𝐧 :</b> {duration}\n\n📢 <b>𝐉𝐨𝐢𝐧 :</b> {join}\n🌐 <b>𝐕𝐢𝐬𝐢𝐭 :</b> {username}\n\n⚡ <b>𝐄𝐧𝐣𝐨𝐲 𝐘𝐨𝐮𝐫 𝐌𝐨𝐯𝐢𝐞!</b> 🍿")
+        await self.set_default("caption_template", DEFAULT_CAPTION_TEMPLATE)
+        if (await self.get("caption_template", "")) == LEGACY_CAPTION_TEMPLATE:
+            await self.set("caption_template", DEFAULT_CAPTION_TEMPLATE)
         await self.set_default("caption_join", "")
         await self.set_default("caption_visit", "")
         current_delete = await self.get("auto_delete_minutes", "")
@@ -158,6 +207,17 @@ class DB:
                     for row in rows
                 ],
             )
+        for col, ddl in (("season", "INTEGER DEFAULT 0"), ("episode", "INTEGER DEFAULT 0"),
+                         ("air_date", "TEXT DEFAULT ''"), ("show_key", "TEXT DEFAULT ''")):
+            if col not in cols:
+                await self.conn.execute(f"ALTER TABLE movies ADD COLUMN {col} {ddl}")
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_movies_show_added ON movies (show_key, added_at DESC)"
+        )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_movies_added_at ON movies (added_at DESC)"
+        )
+        await self.backfill_show_keys(commit=False)
         await self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_movies_content_type_added_at ON movies (content_type, added_at DESC)"
         )
@@ -212,7 +272,7 @@ class DB:
             await conn.close()
 
     async def export_state(self) -> dict:
-        tables = ("users", "movies", "history", "plans", "coupons", "coupon_uses", "admins", "settings", "stats", "payments", "audit_logs", "delivery_expiry")
+        tables = ("users", "movies", "history", "plans", "coupons", "coupon_uses", "admins", "settings", "stats", "payments", "audit_logs", "delivery_expiry", "follows")
         state = {"version": 1, "tables": {}}
         for table in tables:
             cur = await self.conn.execute(f"SELECT * FROM {table}")
@@ -222,7 +282,7 @@ class DB:
     async def export_tables(self, table_names: tuple[str, ...]) -> dict:
         state = {"version": 1, "tables": {}}
         for table in table_names:
-            if table not in {"users", "movies", "history", "plans", "coupons", "coupon_uses", "admins", "settings", "stats", "payments", "audit_logs", "delivery_expiry"}:
+            if table not in {"users", "movies", "history", "plans", "coupons", "coupon_uses", "admins", "settings", "stats", "payments", "audit_logs", "delivery_expiry", "follows"}:
                 continue
             cur = await self.conn.execute(f"SELECT * FROM {table}")
             state["tables"][table] = [dict(row) for row in await cur.fetchall()]
@@ -258,12 +318,15 @@ class DB:
     async def bulk_upsert_movies(self, rows: list[tuple]) -> int:
         if not rows:
             return 0
+        # rows: (msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at)
+        rows = [tuple(row[:13]) + episode_columns(row[1], row[7]) for row in rows]
         await self.conn.executemany(
-            """INSERT INTO movies (msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            f"""INSERT INTO movies ({MOVIE_COLUMNS})
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(msg_id) DO UPDATE SET title=excluded.title, year=excluded.year,
                  quality=excluded.quality, language=excluded.language, size=excluded.size,
-                 caption=excluded.caption,
+                 caption=excluded.caption, season=excluded.season, episode=excluded.episode,
+                 air_date=excluded.air_date, show_key=excluded.show_key,
                  duration=CASE WHEN excluded.duration != '' THEN excluded.duration ELSE movies.duration END,
                  file_id=CASE WHEN excluded.file_id != '' THEN excluded.file_id ELSE movies.file_id END,
                  file_type=CASE WHEN excluded.file_type != '' THEN excluded.file_type ELSE movies.file_type END,
@@ -278,7 +341,7 @@ class DB:
         try:
             await self.conn.execute("BEGIN")
             for table, rows in tables.items():
-                if table not in {"users", "movies", "history", "plans", "coupons", "coupon_uses", "admins", "settings", "stats", "payments", "audit_logs", "delivery_expiry"}:
+                if table not in {"users", "movies", "history", "plans", "coupons", "coupon_uses", "admins", "settings", "stats", "payments", "audit_logs", "delivery_expiry", "follows"}:
                     continue
                 cur = await self.conn.execute(f"PRAGMA table_info({table})")
                 columns = {row["name"] for row in await cur.fetchall()}
@@ -362,8 +425,9 @@ class DB:
                            language: str, size: str, caption: str,
                            file_id: str = "", file_type: str = "", content_type: str = "movie",
                            duration: str = "",
-                           storage_msg_id: int = 0, commit: bool = True) -> bool:
+                           storage_msg_id: int = 0, commit: bool = True, added_at: int = 0) -> bool:
         safe_type = content_type if content_type in {"movie", "series", "anime"} else "movie"
+        season, episode, air_date, key = episode_columns(title, caption)
         if file_id:
             cur = await self.conn.execute(
                 "SELECT msg_id, storage_msg_id FROM movies WHERE file_id=? AND msg_id<>? LIMIT 1",
@@ -373,25 +437,27 @@ class DB:
             if duplicate:
                 if storage_msg_id > 0 and not duplicate["storage_msg_id"]:
                     await self.conn.execute(
-                        "UPDATE movies SET msg_id=?, storage_msg_id=?, title=?, year=?, quality=?, language=?, size=?, duration=?, caption=?, file_type=?, content_type=? WHERE msg_id=?",
-                        (msg_id, storage_msg_id, title, year, quality, language, size, duration, caption, file_type, safe_type, duplicate["msg_id"]),
+                        "UPDATE movies SET msg_id=?, storage_msg_id=?, title=?, year=?, quality=?, language=?, size=?, duration=?, caption=?, file_type=?, content_type=?, season=?, episode=?, air_date=?, show_key=? WHERE msg_id=?",
+                        (msg_id, storage_msg_id, title, year, quality, language, size, duration, caption, file_type, safe_type, season, episode, air_date, key, duplicate["msg_id"]),
                     )
                     if commit:
                         await self.conn.commit()
                     return True
                 return False
         await self.conn.execute(
-            """INSERT INTO movies (msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            f"""INSERT INTO movies ({MOVIE_COLUMNS})
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(msg_id) DO UPDATE SET title=excluded.title, year=excluded.year,
                  quality=excluded.quality, language=excluded.language, size=excluded.size,
-                 caption=excluded.caption,
+                 caption=excluded.caption, season=excluded.season, episode=excluded.episode,
+                 air_date=excluded.air_date, show_key=excluded.show_key,
                  duration=CASE WHEN excluded.duration != '' THEN excluded.duration ELSE movies.duration END,
                  file_id=CASE WHEN excluded.file_id != '' THEN excluded.file_id ELSE movies.file_id END,
                  file_type=CASE WHEN excluded.file_type != '' THEN excluded.file_type ELSE movies.file_type END,
                  storage_msg_id=CASE WHEN excluded.storage_msg_id > 0 THEN excluded.storage_msg_id ELSE movies.storage_msg_id END,
                  content_type=excluded.content_type""",
-            (msg_id, title, year, quality, language, size, duration, caption, file_id, file_type, storage_msg_id, safe_type, int(time.time())),
+            (msg_id, title, year, quality, language, size, duration, caption, file_id, file_type, storage_msg_id, safe_type,
+             int(added_at or time.time()), season, episode, air_date, key),
         )
         if commit:
             await self.conn.commit()
@@ -421,12 +487,12 @@ class DB:
         q = f"%{query}%"
         if safe_type:
             cur = await self.conn.execute(
-                "SELECT * FROM movies WHERE storage_msg_id > 0 AND content_type=? AND LOWER(title) LIKE LOWER(?) LIMIT ?",
+                "SELECT * FROM movies WHERE storage_msg_id > 0 AND content_type=? AND LOWER(title) LIKE LOWER(?) ORDER BY added_at DESC, msg_id DESC LIMIT ?",
                 (safe_type, q, limit * 3),
             )
         else:
             cur = await self.conn.execute(
-                "SELECT * FROM movies WHERE storage_msg_id > 0 AND LOWER(title) LIKE LOWER(?) LIMIT ?",
+                "SELECT * FROM movies WHERE storage_msg_id > 0 AND LOWER(title) LIKE LOWER(?) ORDER BY added_at DESC, msg_id DESC LIMIT ?",
                 (q, limit * 3),
             )
         return await cur.fetchall()
@@ -535,7 +601,7 @@ class DB:
         await self.conn.commit()
 
     async def popular_movies(self, content_type: str = "", limit: int = 10) -> list[aiosqlite.Row]:
-        safe_limit = max(1, min(int(limit), 15))
+        safe_limit = max(1, min(int(limit), 50))
         safe_type = content_type if content_type in {"movie", "series", "anime"} else ""
         type_clause = " AND m.content_type=?" if safe_type else ""
         params = (safe_type, safe_limit) if safe_type else (safe_limit,)
@@ -571,6 +637,139 @@ class DB:
             params,
         )
         return await cur.fetchall()
+
+    # ---------- TV shows: episodes / latest / follows ----------
+    async def backfill_show_keys(self, commit: bool = True) -> int:
+        """Fill season/episode/show_key for rows restored from older backups."""
+        cur = await self.conn.execute(
+            "SELECT msg_id, title, caption FROM movies WHERE show_key IS NULL OR show_key=''"
+        )
+        rows = await cur.fetchall()
+        if rows:
+            await self.conn.executemany(
+                "UPDATE movies SET season=?, episode=?, air_date=?, show_key=? WHERE msg_id=?",
+                [(*episode_columns(r["title"], r["caption"]), r["msg_id"]) for r in rows],
+            )
+            if commit:
+                await self.conn.commit()
+        return len(rows)
+
+    async def has_duplicate_upload(self, file_id: str, caption: str, size: str) -> bool:
+        """Same file, or same caption + same size (re-post). Generic captions alone never match."""
+        if file_id:
+            cur = await self.conn.execute(
+                "SELECT 1 FROM movies WHERE storage_msg_id > 0 AND file_id=? LIMIT 1", (file_id,)
+            )
+            if await cur.fetchone():
+                return True
+        caption_norm = " ".join((caption or "").split()).strip().casefold()
+        if not caption_norm or not size:
+            return False
+        cur = await self.conn.execute(
+            "SELECT caption FROM movies WHERE storage_msg_id > 0 AND size=? ORDER BY added_at DESC LIMIT 500",
+            (size,),
+        )
+        for row in await cur.fetchall():
+            if " ".join(str(row["caption"] or "").split()).strip().casefold() == caption_norm:
+                return True
+        return False
+
+    async def latest_uploads(self, offset: int = 0, limit: int = 10) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT * FROM movies WHERE storage_msg_id > 0 ORDER BY added_at DESC, msg_id DESC LIMIT ? OFFSET ?",
+            (max(1, min(int(limit), 50)), max(0, int(offset))),
+        )
+        return await cur.fetchall()
+
+    async def uploads_since(self, since_ts: int) -> int:
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) c FROM movies WHERE storage_msg_id > 0 AND added_at >= ?", (int(since_ts),)
+        )
+        return (await cur.fetchone())["c"]
+
+    async def latest_show_titles(self, limit: int = 3) -> list[str]:
+        cur = await self.conn.execute(
+            "SELECT title, show_key FROM movies WHERE storage_msg_id > 0 ORDER BY added_at DESC, msg_id DESC LIMIT 60"
+        )
+        seen, titles = set(), []
+        for row in await cur.fetchall():
+            key = row["show_key"] or str(row["title"] or "").lower()
+            if key and key not in seen:
+                seen.add(key)
+                titles.append(str(row["title"] or ""))
+            if len(titles) >= limit:
+                break
+        return titles
+
+    async def show_episodes(self, key: str, offset: int = 0, limit: int = 10) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            """SELECT * FROM movies WHERE storage_msg_id > 0 AND show_key=?
+               ORDER BY added_at DESC, season DESC, episode DESC, msg_id DESC LIMIT ? OFFSET ?""",
+            (key, max(1, min(int(limit), 50)), max(0, int(offset))),
+        )
+        return await cur.fetchall()
+
+    async def show_episode_count(self, key: str) -> int:
+        if not key:
+            return 0
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) c FROM movies WHERE storage_msg_id > 0 AND show_key=?", (key,)
+        )
+        return (await cur.fetchone())["c"]
+
+    async def latest_episode_id(self, key: str) -> int:
+        cur = await self.conn.execute(
+            "SELECT msg_id FROM movies WHERE storage_msg_id > 0 AND show_key=? ORDER BY added_at DESC, msg_id DESC LIMIT 1",
+            (key,),
+        )
+        row = await cur.fetchone()
+        return int(row["msg_id"]) if row else 0
+
+    async def follow(self, user_id: int, key: str, title: str) -> bool:
+        if not key:
+            return False
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO follows (user_id, show_key, show_title, at) VALUES (?,?,?,?)",
+            (user_id, key, title[:120], int(time.time())),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def unfollow(self, user_id: int, key: str) -> bool:
+        cur = await self.conn.execute("DELETE FROM follows WHERE user_id=? AND show_key=?", (user_id, key))
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def unfollow_id(self, user_id: int, follow_id: int) -> bool:
+        cur = await self.conn.execute("DELETE FROM follows WHERE user_id=? AND id=?", (user_id, follow_id))
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def is_following(self, user_id: int, key: str) -> bool:
+        cur = await self.conn.execute("SELECT 1 FROM follows WHERE user_id=? AND show_key=?", (user_id, key))
+        return await cur.fetchone() is not None
+
+    async def follows(self, user_id: int) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT * FROM follows WHERE user_id=? ORDER BY at DESC LIMIT 50", (user_id,)
+        )
+        return await cur.fetchall()
+
+    async def followers(self, key: str) -> list[int]:
+        cur = await self.conn.execute(
+            """SELECT f.user_id FROM follows AS f LEFT JOIN users AS u ON u.user_id = f.user_id
+               WHERE f.show_key=? AND COALESCE(u.banned, 0)=0""",
+            (key,),
+        )
+        return [int(r["user_id"]) for r in await cur.fetchall()]
+
+    async def mark_alert_sent(self, msg_id: int) -> bool:
+        """True only the first time an episode alert is claimed."""
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO episode_alerts (msg_id, at) VALUES (?, ?)", (msg_id, int(time.time()))
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
 
     # ---------- history ----------
     async def add_history(self, user_id: int, query: str, title: str, msg_id: int) -> None:

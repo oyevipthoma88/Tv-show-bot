@@ -32,7 +32,7 @@ class RequestedFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.db.redeem_coupon("ROHAN50", 102))
 
     async def test_new_settings_and_expiry_are_snapshot_persisted(self):
-        self.assertIn("Movie Bot Tutorial", await self.db.get("tutorial"))
+        self.assertIn("TV Show Bot", await self.db.get("tutorial"))
         self.assertEqual(await self.db.get("online_player_bot"), "")
         self.assertEqual(await self.db.get("auto_delete_minutes"), "7")
         await self.db.schedule_expiry(101, 202, 9999999999)

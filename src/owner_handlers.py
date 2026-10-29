@@ -47,12 +47,46 @@ async def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
 
 
+async def owner_dashboard_text() -> str:
+    """Owner Panel header: one-glance health of the TV bot."""
+    import time as _time
+    import config as _cfg
+    import userbot
+    try:
+        users = await db.user_count(include_banned=True)
+        premium = len(await db.premium_users())
+        total = await db.movie_count(storage_only=True)
+        today = await db.uploads_since(int(_time.time()) - 86400)
+    except Exception:
+        users = premium = total = today = 0
+    sources = [x for x in (await db.get("movie_channels", "")).split(",") if x.strip()]
+    live_on = await db.get("live_mirror_enabled", "1") != "0"
+    logged_in = userbot.has_api() and bool(_cfg.TG_SESSION)
+    login = ("✅ " + (userbot._me_label or "Logged in")) if logged_in else "❌ Login nahi hai → 🔐 Login Account dabao"
+    if not live_on:
+        mirror = "🔴 OFF"
+    elif not logged_in:
+        mirror = "⚪ Login ke baad start hoga"
+    else:
+        mirror = "🟢 Running" if userbot.is_live() else "🟡 Connecting…"
+    return (
+        "🛠 <b>Owner Panel</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"👥 Users: <b>{users}</b>  •  💎 Premium: <b>{premium}</b>\n"
+        f"📺 Episodes: <b>{total}</b>  •  🆕 Last 24h: <b>{today}</b>\n\n"
+        f"🔐 Account: {login}\n"
+        f"📡 Live Mirror: <b>{mirror}</b>\n"
+        f"🎞 Source channels: <b>{len(sources)}</b>"
+        + ("" if sources else " → 🎞 Source Channels me set karo")
+    )
+
+
 @router.message(Command("ownerpanel"))
 async def panel_cmd(message: Message, bot: Bot):
     if not await is_owner(message.from_user.id):
         return
     await log_command(bot, message.from_user, "ownerpanel")
-    await message.answer("🛠 <b>Owner Panel</b>", reply_markup=owner_panel_kb())
+    await message.answer(await owner_dashboard_text(), reply_markup=owner_panel_kb())
 
 
 @router.callback_query(F.data == "op:home")
@@ -62,7 +96,7 @@ async def panel(cb: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await cb.answer()
-    await cb.message.answer("🛠 <b>Owner Panel</b>", reply_markup=owner_panel_kb())
+    await cb.message.answer(await owner_dashboard_text(), reply_markup=owner_panel_kb())
 
 
 async def _ask(cb: CallbackQuery, state: FSMContext, st: State, text: str):
@@ -317,7 +351,7 @@ async def op_caption(cb: CallbackQuery, state: FSMContext):
                "Full template bhejo, ya sirf line change karo:\n"
                "<code>join:https://t.me/YourChannel</code>\n<code>visit:https://t.me/YourUsername</code>\n"
                "Remove ke liye <code>join:remove</code> / <code>visit:remove</code>; Heroku default ke liye <code>join:reset</code> / <code>visit:reset</code>.\n\n"
-               "Placeholders: <code>{movie_name}</code> <code>{quality}</code> <code>{duration}</code> <code>{join}</code> <code>{username}</code>\n\n"
+               "Placeholders: <code>{movie_name}</code> (show) <code>{episode}</code> <code>{date}</code> <code>{quality}</code> <code>{duration}</code> <code>{join}</code> <code>{username}</code>\n\n"
                f"Current:\n<code>{current[:900]}</code>")
 
 
@@ -361,7 +395,7 @@ async def set_caption(message: Message, state: FSMContext):
         link = value[6:].strip()
         await db.set("caption_visit", "-" if link.lower() in {"remove", "off", "disable"} else "" if link.lower() == "reset" else link)
     else:
-        allowed = {"{movie_name}", "{quality}", "{duration}", "{join}", "{username}", "{extra}"}
+        allowed = {"{movie_name}", "{quality}", "{duration}", "{join}", "{username}", "{extra}", "{episode}", "{date}"}
         if not any(token in value for token in allowed):
             return await message.answer("Template me kam se kam ek placeholder use karo.")
         await db.set("caption_template", value)
@@ -588,7 +622,7 @@ async def do_broadcast(message: Message, bot: Bot, state: FSMContext):
 async def op_setchannel(cb: CallbackQuery, state: FSMContext):
     cur = await get_movie_channel()
     await _ask(cb, state, Own.setchannel,
-               f"🎞 <b>Movie channels set</b>\n\nAbhi: <code>{await db.get('movie_channels', str(cur or 'not set'))}</code>\n\n"
+               f"🎞 <b>Source channels set</b>\n\nAbhi: <code>{await db.get('movie_channels', str(cur or 'not set'))}</code>\n\n"
                "Sirf source chat ID/username bhejo; save hone ke baad `/scanall` ya `/scanfull` manually chalao:\n"
                "<code>-1003906081303</code>\nBot admin wale channel ho ya non-admin (Login Account se) — naye uploads turant MAIN_DATA me share honge.")
 
@@ -623,7 +657,7 @@ async def do_setchannel(message: Message, bot: Bot, state: FSMContext):
     await message.answer(
         f"✅ {len(ids)} source channel(s) save ho gaye: <b>{', '.join(titles[:5])}</b>\n\n"
         "📡 Live Mirror ON ho to naye uploads turant MAIN_DATA me share honge.\n"
-        "Purana content: Owner Panel → Scan Movie Channel se "
+        "Purana content: Owner Panel → 🔍 Scan Channel se "
         "<code>/scanall</code> ya apni range bhejkar MAIN_DATA me index/copy banao."
     )
 

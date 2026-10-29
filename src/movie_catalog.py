@@ -21,4 +21,4 @@ def detect_content_type(text: str) -> str:
 
 
 def catalog_label(content_type: str) -> str:
-    return {"movie": "Movies", "series": "Web Series", "anime": "Anime"}.get(content_type, "Movies")
+    return {"movie": "Movie", "series": "TV Show / Series", "anime": "Anime"}.get(content_type, "TV Show")

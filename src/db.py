@@ -678,6 +678,47 @@ class DB:
         await self.conn.commit()
         return changed
 
+    async def rekey_all_shows(self, version: str = "sep-v2") -> int:
+        """One-time full regroup after show-name parsing improved (underscore /
+        dot file names, episode title no longer part of the show). Runs once per
+        version, in chunks, then rewrites old follows to the new keys."""
+        if await self.get("show_rekey_version", "") == version:
+            return 0
+        changed, last = 0, 0
+        remap: dict[str, str] = {}
+        while True:
+            cur = await self.conn.execute(
+                "SELECT msg_id, title, caption, show_key FROM movies WHERE msg_id>? ORDER BY msg_id LIMIT 2000",
+                (last,),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                break
+            updates = []
+            for r in rows:
+                last = r["msg_id"]
+                season, episode, air, _ = episode_columns(r["title"], r["caption"])
+                cap = (r["caption"] or "").strip()
+                # single-line caption = usually the original file name, which
+                # still has S02E17 that the old title parser stripped away
+                one_line = cap and "\n" not in cap and len(cap) < 300
+                key = (make_show_key(cap) if one_line else "") or make_show_key(r["title"] or "")
+                if key and key != (r["show_key"] or ""):
+                    if r["show_key"]:
+                        remap[r["show_key"]] = key
+                    updates.append((season, episode, air, key, r["msg_id"]))
+            if updates:
+                await self.conn.executemany(
+                    "UPDATE movies SET season=?, episode=?, air_date=?, show_key=? WHERE msg_id=?", updates)
+                changed += len(updates)
+            await self.conn.commit()
+        for old, new in remap.items():
+            await self.conn.execute("UPDATE OR IGNORE follows SET show_key=? WHERE show_key=?", (new, old))
+            await self.conn.execute("DELETE FROM follows WHERE show_key=?", (old,))
+        await self.conn.commit()
+        await self.set("show_rekey_version", version)
+        return changed
+
     async def backfill_show_keys(self, commit: bool = True) -> int:
         """Fill season/episode/show_key for rows restored from older backups."""
         cur = await self.conn.execute(

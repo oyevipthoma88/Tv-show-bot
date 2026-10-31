@@ -693,9 +693,19 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
     except (KeyError, IndexError):
         top_key = ""
     extra = []
+    auto_followed = False
     if top_key:
         total_eps = await db.show_episode_count(top_key)
         following = await db.is_following(message.from_user.id, top_key)
+        # Searched a show -> auto-follow so the NEXT episode is notified.
+        # The Follow/Unfollow toggle below lets the user switch it off.
+        if not following:
+            try:
+                show_title = display_name(top_key, str(top["title"] or "Show"))
+                auto_followed = await db.follow(message.from_user.id, top_key, show_title)
+                following = following or auto_followed
+            except Exception as exc:
+                logging.warning("Auto-follow failed for %s: %s", top_key, exc)
         extra = follow_rows(top, following, total_eps, len(results))
     # Follow / Unfollow for every other distinct show in the results too.
     seen_keys = {top_key} if top_key else set()
@@ -713,7 +723,9 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
                              callback_data=f"fl:{row['msg_id']}", style="danger" if is_f else "success")])
         if len(seen_keys) >= 4:
             break
-    fix_note = (f"<blockquote>✏️ Spelling theek karke <b>{escape(autocorrected)}</b> dikha raha hoon</blockquote>\n"
+    follow_note = ("<blockquote>🔔 Is show ka naya episode aate hi aapko notification milega. "
+                   "Nahi chahiye to niche 🔕 Unfollow dabao.</blockquote>\n" if auto_followed else "")
+    fix_note = follow_note + (f"<blockquote>✏️ Spelling theek karke <b>{escape(autocorrected)}</b> dikha raha hoon</blockquote>\n"
                 if autocorrected else "")
     await message.answer(
         fix_note +
@@ -1030,6 +1042,21 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await db.add_history(cb.from_user.id, "", "Direct channel", msg_id)
     except Exception as exc:
         logging.warning("Direct delivery bookkeeping failed for %s: %s", msg_id, exc)
+    # Episode was pulled from a joined channel into MAIN_DATA: auto-follow its
+    # show and give a Follow/Unfollow toggle for next-episode alerts.
+    try:
+        _row = await db.movie(msg_id)
+        _key = (_row["show_key"] or "") if _row else ""
+        if _key:
+            _name = display_name(_key, str(_row["title"] or "Show"))
+            await db.follow(cb.from_user.id, _key, _name)
+            await cb.message.answer(
+                f"<blockquote>🔔 <b>{escape(_name)}</b> follow ho gaya — naya episode aate hi notification milega.</blockquote>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    button("🔕 Unfollow", callback_data=f"fl:{msg_id}", style="danger")]]),
+            )
+    except Exception as exc:
+        logging.warning("Auto-follow after direct delivery failed for %s: %s", msg_id, exc)
 
 
 def _sq_data(text: str) -> str:

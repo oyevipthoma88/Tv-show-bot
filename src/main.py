@@ -55,6 +55,12 @@ async def main() -> None:
     filled = await db.backfill_show_keys()
     if filled:
         logging.info("TV grouping filled for %s restored episodes", filled)
+    try:
+        rekeyed = await db.rekey_all_shows()
+        if rekeyed:
+            logging.info("Regrouped %s episodes with the new file-name parser", rekeyed)
+    except Exception:
+        logging.exception("Show regroup failed")
     # One show = one key ("TMKOC" / "Taarak Mehta" / "Tarak Mehta Ka Oolta Chasma").
     try:
         merged = await db.recanonicalize_show_keys()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
 from collections import OrderedDict
@@ -489,9 +490,19 @@ async def import_to_main(chat_id: int, msg_id: int, account: int = 0):
     return None
 
 
+def _file_name(document) -> str:
+    for a in getattr(document, "attributes", []) or []:
+        if getattr(a, "file_name", ""):
+            return a.file_name
+    return ""
+
+
 def _hit(m, peer: int, account: int) -> dict:
     cap = m.message or ""
-    title = (cap.split("\n")[0][:200].strip() if cap else "") or _doc_meta(m.document, cap).get("title") or f"Episode {m.id}"
+    fname = _file_name(getattr(m, "document", None))
+    title = (cap.split("\n")[0][:200].strip() if cap else "") or fname or _doc_meta(m.document, cap).get("title") or f"Episode {m.id}"
+    if fname and fname not in cap:
+        cap = (cap + "\n" + fname).strip()
     return {"msg_id": m.id, "channel_id": peer, "title": title, "caption": cap,
             "source": True, "account": account, "date": int(m.date.timestamp()) if m.date else 0}
 
@@ -499,14 +510,26 @@ def _hit(m, peer: int, account: int) -> dict:
 async def search_sources(query: str, limit: int = 10) -> list[dict]:
     """Search EVERY channel any logged-in account has joined — one global MTProto
     search per account (all accounts in parallel), plus the configured sources."""
-    q = query.strip()[:100]
+    from episode import normalize_separators, parse_episode
+    q = normalize_separators(query)[:100]
     clients = [(i, c) for i, c in enumerate([_live_client, *_extra_clients]) if c is not None and c.is_connected()]
     if not clients or not q:
         return []
+    # Telegram's search treats "Indian_Game_Show" / "Indian.Game.Show" as other
+    # words than "Indian Game Show", so ask for every spelling style and then
+    # keep only hits whose normalized text really contains all query words.
+    wanted = parse_episode(q)
+    base = wanted.get("show") or wanted["cleaned"] or q
+    words = [w for w in re.sub(r"[^a-z0-9 ]", " ", base.lower()).split() if w]
+    variants = []
+    for v in (q, base, "_".join(base.split()), ".".join(base.split()), words[0] if words else ""):
+        v = v.strip()
+        if v and v.lower() not in [x.lower() for x in variants]:
+            variants.append(v)
     from telethon import functions, types, utils as tg_utils
     main_id = int(config.MAIN_DATA)
 
-    async def global_one(idx, client):
+    async def global_one(idx, client, q=q):
         out = []
         try:
             res = await client(functions.messages.SearchGlobalRequest(
@@ -536,15 +559,17 @@ async def search_sources(query: str, limit: int = 10) -> list[dict]:
                 try:
                     entity = await client.get_entity(target)
                     peer = tg_utils.get_peer_id(entity)
-                    async for m in client.iter_messages(entity, search=q, limit=limit):
-                        if getattr(m, "document", None):
-                            out.append(_hit(m, peer, idx))
+                    for v in variants:
+                        async for m in client.iter_messages(entity, search=v, limit=max(limit, 30)):
+                            if getattr(m, "document", None):
+                                out.append(_hit(m, peer, idx))
                     break
                 except Exception as exc:
                     log.debug("source search %s acc%s failed: %s", target, idx, exc)
         return out
 
-    tasks = [global_one(i, c) for i, c in clients] + [source_one(t) for t in [*ids, *names]]
+    tasks = ([global_one(i, c, v) for i, c in clients for v in variants]
+             + [source_one(t) for t in [*ids, *names]])
     try:
         results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=15)
     except asyncio.TimeoutError:
@@ -553,10 +578,21 @@ async def search_sources(query: str, limit: int = 10) -> list[dict]:
     for chunk in results:
         for r in chunk:
             k = (r["channel_id"], r["msg_id"])
-            if k not in seen:
-                seen.add(k)
-                flat.append(r)
-    flat.sort(key=lambda r: r.get("date", 0), reverse=True)
+            if k in seen:
+                continue
+            seen.add(k)
+            text = re.sub(r"[^a-z0-9 ]", " ", normalize_separators(
+                f"{r.get('title', '')} {r.get('caption', '')}").lower())
+            have = set(text.split())
+            # every query word must be present (episode filter happens later)
+            if words and not all(w in have for w in words):
+                continue
+            ep = parse_episode(f"{r.get('title', '')} {r.get('caption', '')}")
+            if wanted["episode"] and ep["episode"] and ep["episode"] != wanted["episode"]:
+                continue
+            r["_ep"] = ep["episode"]
+            flat.append(r)
+    flat.sort(key=lambda r: (r.get("date", 0), r.get("_ep", 0)), reverse=True)
     return flat[: limit * 2]
 
 

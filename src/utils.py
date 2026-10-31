@@ -15,7 +15,7 @@ from config import (
 )
 from db import db
 from aliases import canonical_show
-from episode import parse_episode
+from episode import parse_episode, normalize_separators, show_key as _show_key
 
 QUALITY_PATTERNS = [
     (r"\b(2160p|4k|uhd)\b", "2160p"),
@@ -53,7 +53,8 @@ def parse_caption(caption: str) -> dict:
     low = text.lower()
     # TV captions: pull out season/episode/air-date first so the show name stays clean.
     ep = parse_episode(raw)
-    title_source = ep["cleaned"] or text
+    # "Indian_Game_Show_S02E17_Neena_Join.mp4" -> title "Indian Game Show"
+    title_source = ep.get("show") or ep["cleaned"] or normalize_separators(text)
 
     quality = ""
     for pat, label in QUALITY_PATTERNS:
@@ -146,12 +147,24 @@ async def search_movies(query: str, limit: int = 20, content_type: str = "") -> 
     """Return exact/strong title matches; avoid broad fuzzy matches for short queries."""
     # Only records linked to a MAIN_DATA post are deliverable. This prevents
     # stale source-channel rows from appearing and then failing on tap.
+    query = normalize_separators(query)
     wanted = parse_episode(query)
-    if (wanted["episode"] or wanted["season"] or wanted["air_date"]) and wanted["cleaned"]:
-        query = wanted["cleaned"]
+    if (wanted["episode"] or wanted["season"] or wanted["air_date"]) and (wanted.get("show") or wanted["cleaned"]):
+        query = wanted.get("show") or wanted["cleaned"]
     q_norm = norm(query)
     if not q_norm:
         return []
+
+    # Same grouping key the indexer stores -> every file-name style
+    # ("Indian_Game_Show", "Indian.Game.Show", "Indian Game Show") hits one show.
+    try:
+        key = _show_key(query)
+        if key and not canonical_show(q_norm):
+            rows = await db.show_rows(key, content_type=content_type, limit=200)
+            if rows:
+                return _filter_episode(newest_first(rows), wanted)[:limit]
+    except Exception:
+        pass
 
     # Shortcut / alias ("tmkoc", "big boss", "tarak mehta ka oolta chsma"):
     # every caption variant of the serial shares one show_key -> fetch by key.

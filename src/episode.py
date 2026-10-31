@@ -81,9 +81,34 @@ def _find_date(text: str, today: _dt.date):
     return None, None
 
 
+_EXT = re.compile(r"\.(mp4|mkv|avi|mov|webm|m4v|ts)\b", re.I)
+
+
+def normalize_separators(text: str) -> str:
+    """File-name style captions -> plain words.
+
+    "Indian_Game_Show_Season_2_Episode_24.mp4" / "Mannat.-.Har.Khushi.S01E05" ->
+    "Indian Game Show Season 2 Episode 24" / "Mannat - Har Khushi S01E05".
+    Underscores always become spaces ("_" is a regex word char, so it broke
+    every \\b-based season/episode rule). Dots become spaces unless they sit
+    between two digits (dates like 28.10.2026, "AAC2.0" stay intact).
+    """
+    t = (text or "").replace("\n", " ")
+    t = _EXT.sub(" ", t)
+    t = t.replace("_", " ")
+    t = re.sub(r"(?<!\d)\.|\.(?!\d)", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
 def parse_episode(text: str, today: _dt.date | None = None) -> dict:
-    """Detect season/episode/air date and return the text with those parts removed."""
-    raw = (text or "").replace("\n", " ")
+    """Detect season/episode/air date and return the text with those parts removed.
+
+    Also returns "show": only the words BEFORE the first season/episode/date
+    marker ("Udne Ki Aasha S02E917 Pankhuri Refuses" -> "Udne Ki Aasha"), so the
+    per-episode title never pollutes the show name.
+    """
+    raw = normalize_separators(text)
     today = today or _dt.date.today()
     season = episode = 0
     air_date = ""
@@ -116,9 +141,22 @@ def parse_episode(text: str, today: _dt.date | None = None) -> dict:
                 cleaned = cleaned[:num.start()] + " " + cleaned[num.end():]
                 break
 
+    show = ""
+    marks = [mm.start() for rx in (_SXE, _EPISODE, _SEASON) for mm in [rx.search(raw)] if mm]
+    if found:
+        _, raw_span = _find_date(raw, today)
+        if raw_span:
+            marks.append(raw_span[0])
+    if marks:
+        first = min(marks)
+        show = _LEFTOVER.sub(" ", raw[:first])
+        show = re.sub(r"\s+", " ", show).strip(" -:|,.")
+        if len(re.sub(r"[^a-z0-9]", "", show.lower())) < 2:
+            show = ""
     cleaned = _LEFTOVER.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|,.")
-    return {"season": season, "episode": episode, "air_date": air_date, "cleaned": cleaned}
+    return {"season": season, "episode": episode, "air_date": air_date, "cleaned": cleaned,
+            "show": show}
 
 
 def _norm(value: str) -> str:
@@ -128,7 +166,8 @@ def _norm(value: str) -> str:
 
 def show_key(title: str) -> str:
     """Stable grouping key for a show name ("Anupamaa Episode 12" -> "anupamaa")."""
-    base = parse_episode(title or "")["cleaned"]
+    info = parse_episode(title or "")
+    base = info.get("show") or info["cleaned"]
     base = _QUALITY_JUNK.sub(" ", base)
     base = re.sub(r"\b(19[5-9]\d|20[0-4]\d)\b", " ", base)
     key = _norm(base)
@@ -168,4 +207,4 @@ def pretty_date(iso: str) -> str:
         return ""
 
 
-__all__ = ["parse_episode", "show_key", "display_name", "episode_label", "pretty_date"]
+__all__ = ["normalize_separators", "parse_episode", "show_key", "display_name", "episode_label", "pretty_date"]

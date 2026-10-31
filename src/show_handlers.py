@@ -161,6 +161,16 @@ async def follow_toggle(cb: CallbackQuery):
         await request_snapshot(cb.bot)
     except Exception:
         pass
+    # Flip a lone Follow/Unfollow toggle (auto-follow notice) in place.
+    try:
+        kb = cb.message.reply_markup.inline_keyboard if cb.message and cb.message.reply_markup else []
+        if len(kb) == 1 and len(kb[0]) == 1 and (kb[0][0].callback_data or "").startswith("fl:"):
+            now = await db.is_following(cb.from_user.id, ref["show_key"])
+            await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button(
+                "🔕 Unfollow" if now else "🔔 Follow", callback_data=kb[0][0].callback_data,
+                style="danger" if now else "success")]]))
+    except Exception:
+        pass
     # Refresh the All Episodes screen if that is where the button was pressed.
     if cb.message and cb.message.text and cb.message.text.startswith("📺"):
         view = await episodes_view(cb.from_user.id, int(ref["msg_id"]), 0)

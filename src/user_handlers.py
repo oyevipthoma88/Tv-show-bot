@@ -250,8 +250,12 @@ async def send_home(target: Optional[Message], bot: Bot, user_id: int) -> None:
     first = escape((getattr(target, "chat", None) and target.chat.first_name) or "")
     hello = f"👋 Hi {first}!" if first and target and target.chat.type == "private" else "👋 Hi!"
     text = (
-        f"<b>{hello} Welcome to {bot_name}</b>\n"
-        f"<blockquote>📺 Show ka naam bhejo — episode <b>seedha yahin</b> milega.\n"
+        f"<b>{hello} {bot_name} me swagat hai</b>\n\n"
+        "<b>Episode kaise milega? Bas 3 step:</b>\n"
+        "1️⃣ Show ka naam likh kar bhejo (jaise <i>Anupamaa</i>)\n"
+        "2️⃣ List me se episode par tap karo\n"
+        "3️⃣ File yahin aa jayegi 🎉\n\n"
+        f"<blockquote>🔔 Jo show dhundhoge, uska naya episode aate hi message aayega.\n"
         f"{status}{fresh_line}</blockquote>"
     )
     pic = await db.get("start_pic", "")
@@ -1106,7 +1110,14 @@ async def tutorial(cb: CallbackQuery, bot: Bot):
     await cb.answer()
     await log_callback(bot, cb.from_user, "tutorial", "Viewed tutorial")
     await cb.message.answer(
-        "📘 <b>Tutorial</b>\n\n" + await db.get("tutorial"),
+        "❓ <b>Kaise Use Kare</b>\n\n"
+        "🔎 <b>Show dhundhna:</b> bas naam bhejo — <i>Anupamaa</i>, <i>TMKOC</i>. Galat spelling bhi chalegi.\n"
+        "🎯 <b>Khaas episode:</b> <i>Anupamaa episode 1234</i> ya <i>Mirzapur S2E3</i>\n"
+        "🆕 <b>Naye episode:</b> Home par <b>🆕 Naye Episode</b> dabao\n"
+        "🔔 <b>Notification:</b> jo show dhundhoge wo apne aap follow ho jata hai. "
+        "Band karna ho to <b>🔕 Unfollow</b> dabao. Saare follow <b>Mere Shows</b> me dikhte hain.\n"
+        "🆓 <b>Free:</b> pehle din 3 episode, phir roz 1. Zyada chahiye to 💎 Premium.\n"
+        + ((("\n" + extra) if (extra := (await db.get("tutorial", "") or "").strip()) else "")),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("🏠 Home", callback_data="home")]]),
     )
 

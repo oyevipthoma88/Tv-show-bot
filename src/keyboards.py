@@ -41,16 +41,16 @@ def force_join_kb(channels: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 def main_menu(is_owner: bool, is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Compact home: 3 rows. Everything else lives under ⚙️ More."""
+    """Simple home for new users: one big action, then plain-language buttons."""
     kb = InlineKeyboardBuilder()
-    kb.row(button("🔎 Search Show", callback_data="get_show", style="success"))
+    kb.row(button("🔎 Show Dhundho", callback_data="get_show", style="success"))
     kb.row(
-        button("🆕 Latest", callback_data="latest:0", style="primary"),
-        button("🔔 My Shows", callback_data="myshows", style="primary"),
+        button("🆕 Naye Episode", callback_data="latest:0", style="primary"),
+        button("🔔 Mere Shows", callback_data="myshows", style="primary"),
     )
     kb.row(
         button("💎 Premium", callback_data="plans", style="success"),
-        button("⚙️ More", callback_data="more", style="primary"),
+        button("➕ Aur Options", callback_data="more", style="primary"),
     )
     if is_owner:
         kb.row(button("🛠 Owner Panel", callback_data="op:home", style="danger"))
@@ -62,16 +62,16 @@ def main_menu(is_owner: bool, is_admin: bool = False) -> InlineKeyboardMarkup:
 def more_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
-        button("🔥 Trending", callback_data="trending", style="primary"),
-        button("🕘 History", callback_data="history", style="primary"),
+        button("🔥 Popular Shows", callback_data="trending", style="primary"),
+        button("🕘 Meri History", callback_data="history", style="primary"),
     )
     kb.row(
-        button("🎁 Refer & Earn", callback_data="refer", style="success"),
-        button("🎟 Coupon", callback_data="coupon", style="success"),
+        button("🎁 Dosto Ko Bulao", callback_data="refer", style="success"),
+        button("🎟 Coupon Lagao", callback_data="coupon", style="success"),
     )
     kb.row(
-        button("🎥 Watch Online", callback_data="online_player", style="primary"),
-        button("📘 Help", callback_data="tutorial", style="primary"),
+        button("❓ Kaise Use Kare", callback_data="tutorial", style="primary"),
+        button("🎥 Online Dekho", callback_data="online_player", style="primary"),
     )
     kb.row(button("🏠 Home", callback_data="home", style="danger"))
     return kb.as_markup()

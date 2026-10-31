@@ -101,6 +101,9 @@ async def _is_movie_channel(chat) -> bool:
     return False
 
 
+LAST_INDEXED_ID = 0  # MAIN_DATA id of the row the last index_message() call created
+
+
 async def index_message(message: Message, bot: Bot | None = None, storage_channel: int = 0) -> bool:
     """Index media; optionally copy admin-submitted media into permanent storage."""
     if (message.caption or "").strip() == SNAPSHOT_MARKER:
@@ -128,6 +131,8 @@ async def index_message(message: Message, bot: Bot | None = None, storage_channe
                                       meta["language"], meta["size"], caption,
                                       media.file_id, media_kind(message), detect_content_type(caption),
                                       duration=meta["duration"], storage_msg_id=storage_msg_id)
+    global LAST_INDEXED_ID
+    LAST_INDEXED_ID = index_id if inserted and storage_msg_id else 0
     if not inserted and copied_message_id and bot and storage_channel:
         # Do not leave an orphan duplicate in MAIN_DATA when a source channel
         # contains a file that is already present in the canonical catalog.
@@ -268,8 +273,18 @@ async def approve_source(callback, bot: Bot):
     try:
         source = await bot.forward_message(callback.from_user.id, source_chat_id, source_message_id, disable_notification=True)
         inserted = await index_message(source, bot=bot, storage_channel=STORAGE_CHANNEL)
+        new_id = LAST_INDEXED_ID
         await db.set(key, "approved")
         await request_snapshot(bot)
+        if inserted and new_id:
+            # Manual approval (also the auto-transfer fallback) must alert followers too.
+            try:
+                import alerts
+                from snapshot import request_catalog_save
+                await request_catalog_save()
+                await alerts.queue_new_episode(bot, new_id)
+            except Exception as alert_exc:
+                logging.warning("Episode alert queue failed: %s", alert_exc)
         await callback.answer("Added to MAIN_DATA ✅")
         await callback.message.edit_reply_markup(reply_markup=None)
         result = "✅ <b>Source movie approved</b>\nMAIN_DATA me add/index ho gayi." if inserted else "ℹ️ Movie already catalog me thi; duplicate copy nahi banayi."

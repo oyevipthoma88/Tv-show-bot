@@ -12,6 +12,8 @@ from __future__ import annotations
 import datetime as _dt
 import re
 
+from aliases import canonical_show
+
 _MONTHS = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
     "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
@@ -35,7 +37,8 @@ _LEFTOVER = re.compile(r"\b(full\s+episode|full|episodes?|season|written\s+updat
 _BARE_NUMBER = re.compile(r"(?<![\w.])(\d{3,5})(?![\w.])")
 _QUALITY_JUNK = re.compile(
     r"@\w+|https?://\S+|\b(2160p|1440p|1080p|720p|480p|360p|4k|uhd|fhd|hd|sd|web-?dl|webrip|hdrip|"
-    r"hdtv|x264|x265|hevc|aac|esubs?|hindi|english|dual\s+audio)\b", re.I)
+    r"hdtv|x264|x265|hevc|aac\d?(?:\s\d)?|esubs?|hindi|english|dual\s+audio|mp4|mkv|avi|"
+    r"h\s?\.?\s?26[45]|ddp?\d?(?:\s\d)?|\w*hub|hs\s+dl|hq|new\s+promo|promo|full\s+hd)\b", re.I)
 
 
 def _safe_date(year: int, month: int, day: int):
@@ -128,7 +131,20 @@ def show_key(title: str) -> str:
     base = parse_episode(title or "")["cleaned"]
     base = _QUALITY_JUNK.sub(" ", base)
     base = re.sub(r"\b(19[5-9]\d|20[0-4]\d)\b", " ", base)
-    return _norm(base)[:80]
+    key = _norm(base)
+    # "Anupama Anupama's Unexpected Shock" -> leading word repeated by uploaders
+    key = re.sub(r"^(\w+(?: \w+)?) \1\b", r"\1", key)
+    # Shortcuts / spelling variants of one serial collapse to ONE key, so
+    # Follow + alerts + episode list cover every caption style.
+    canon = canonical_show(key)
+    return (canon or key)[:80]
+
+
+def display_name(key: str, fallback: str = "") -> str:
+    """Nice show name for buttons ("taarak mehta ka ooltah chashmah" -> Title Case)."""
+    if key and canonical_show(key) == key:
+        return key.title()
+    return (fallback or key or "Show").strip()
 
 
 def episode_label(season, episode) -> str:
@@ -152,4 +168,4 @@ def pretty_date(iso: str) -> str:
         return ""
 
 
-__all__ = ["parse_episode", "show_key", "episode_label", "pretty_date"]
+__all__ = ["parse_episode", "show_key", "display_name", "episode_label", "pretty_date"]

@@ -55,6 +55,13 @@ async def main() -> None:
     filled = await db.backfill_show_keys()
     if filled:
         logging.info("TV grouping filled for %s restored episodes", filled)
+    # One show = one key ("TMKOC" / "Taarak Mehta" / "Tarak Mehta Ka Oolta Chasma").
+    try:
+        merged = await db.recanonicalize_show_keys()
+        if merged:
+            logging.info("Merged %s show-name variants into canonical shows", merged)
+    except Exception:
+        logging.exception("Show key merge failed")
     await userbot.load_saved_credentials()
     # Owners added with /addowner (stored in settings, backed up with state).
     from config import OWNER_IDS as _owners
@@ -160,10 +167,17 @@ async def main() -> None:
                     try:
                         await bot.delete_message(row["chat_id"], row["message_id"])
                     except Exception as exc:
-                        logging.info("Expiry delete skipped for %s/%s: %s", row["chat_id"], row["message_id"], exc)
-                    finally:
-                        await db.remove_expiry(row["chat_id"], row["message_id"])
-                        await log_auto_delete(bot, row["chat_id"], row["message_id"])
+                        text_exc = str(exc).lower()
+                        permanent = any(x in text_exc for x in (
+                            "not found", "can't be deleted", "cant be deleted", "chat not found",
+                            "bot was blocked", "user is deactivated", "forbidden"))
+                        logging.info("Expiry delete %s for %s/%s: %s", "dropped" if permanent else "will retry",
+                                     row["chat_id"], row["message_id"], exc)
+                        if permanent:
+                            await db.remove_expiry(row["chat_id"], row["message_id"])
+                        continue  # transient (flood wait / network): retry next cycle
+                    await db.remove_expiry(row["chat_id"], row["message_id"])
+                    await log_auto_delete(bot, row["chat_id"], row["message_id"])
                     try:
                         suggestions = await db.recent_movies("movie", 5, storage_only=True)
                         text = "🗑 <b>Movie auto-delete ho gayi.</b>\n\nAb tum new movie search kar sakte ho."
@@ -339,7 +353,9 @@ async def auto_scan_main_channel(bot: Bot):
                 logging.info("Auto-index: waiting for owner login (Owner Panel → Login Account)")
                 await asyncio.sleep(50)
                 continue
-            channels = MAIN_CHANNELS if MAIN_CHANNELS else [MAIN_DATA]
+            # Only MAIN_DATA: its post IDs are what delivery copies from. Indexing other
+            # channels' IDs here overwrote rows and delivered the wrong file.
+            channels = [MAIN_DATA]
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             try:
@@ -436,18 +452,16 @@ async def _scan_single_channel(client, channel_id: int) -> int:
                         meta["size"] = f"{size_mb/1024:.1f}GB" if size_mb > 1024 else f"{size_mb:.0f}MB"
                 access_hash = getattr(document, "access_hash", 0) if document else 0
                 file_key = f"tg:{getattr(document, 'id', 0)}:{access_hash}" if document else ""
+                posted_at = int(msg.date.timestamp()) if getattr(msg, "date", None) else int(time.time())
                 batch.append((
                     msg.id, meta["title"], meta["year"], meta["quality"],
                     meta["language"], meta["size"], duration, caption,
-                    file_key, file_type, msg.id, detect_content_type(caption), int(time.time())
+                    file_key, file_type, msg.id, detect_content_type(caption), posted_at
                 ))
                 if msg.id > max_id_seen:
                     max_id_seen = msg.id
                 if len(batch) >= BATCH:
-                    await db.conn.executemany(
-                        "INSERT OR REPLACE INTO movies (msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        batch
-                    )
+                    await db.bulk_upsert_movies(batch)  # keeps season/episode/show_key
                     await db.conn.commit()
                     count += len(batch)
                     batch = []
@@ -458,10 +472,7 @@ async def _scan_single_channel(client, channel_id: int) -> int:
             except Exception:
                 continue
         if batch:
-            await db.conn.executemany(
-                "INSERT OR REPLACE INTO movies (msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                batch
-            )
+            await db.bulk_upsert_movies(batch)
             await db.conn.commit()
             count += len(batch)
         await db.set(cursor_key, str(max_id_seen))

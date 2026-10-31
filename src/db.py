@@ -35,6 +35,9 @@ DEFAULT_CAPTION_TEMPLATE = (
     "🌐 <b>𝐕𝐢𝐬𝐢𝐭 :</b> {username}\n\n"
     "⚡ <b>𝐄𝐧𝐣𝐨𝐲 𝐘𝐨𝐮𝐫 𝐒𝐡𝐨𝐰!</b> 🍿"
 )
+# Newest episode first: air date (else upload day), then episode number.
+EPISODE_ORDER = ("COALESCE(NULLIF(air_date,''), date(added_at,'unixepoch')) DESC, "
+                 "season DESC, episode DESC, added_at DESC, msg_id DESC")
 MOVIE_COLUMNS = "msg_id,title,year,quality,language,size,duration,caption,file_id,file_type,storage_msg_id,content_type,added_at,season,episode,air_date,show_key"
 
 
@@ -488,13 +491,13 @@ class DB:
         q = f"%{query}%"
         if safe_type:
             cur = await self.conn.execute(
-                "SELECT * FROM movies WHERE storage_msg_id > 0 AND content_type=? AND LOWER(title) LIKE LOWER(?) ORDER BY added_at DESC, msg_id DESC LIMIT ?",
-                (safe_type, q, limit * 3),
+                "SELECT * FROM movies WHERE storage_msg_id > 0 AND content_type=? AND (LOWER(title) LIKE LOWER(?) OR show_key LIKE LOWER(?)) ORDER BY added_at DESC, msg_id DESC LIMIT ?",
+                (safe_type, q, q, limit * 3),
             )
         else:
             cur = await self.conn.execute(
-                "SELECT * FROM movies WHERE storage_msg_id > 0 AND LOWER(title) LIKE LOWER(?) ORDER BY added_at DESC, msg_id DESC LIMIT ?",
-                (q, limit * 3),
+                "SELECT * FROM movies WHERE storage_msg_id > 0 AND (LOWER(title) LIKE LOWER(?) OR show_key LIKE LOWER(?)) ORDER BY added_at DESC, msg_id DESC LIMIT ?",
+                (q, q, limit * 3),
             )
         return await cur.fetchall()
 
@@ -640,6 +643,41 @@ class DB:
         return await cur.fetchall()
 
     # ---------- TV shows: episodes / latest / follows ----------
+    async def show_rows(self, key: str, content_type: str = "", limit: int = 40) -> list[aiosqlite.Row]:
+        """Deliverable rows of one show (all caption variants share the key)."""
+        sql = "SELECT * FROM movies WHERE storage_msg_id > 0 AND show_key=?"
+        args: list = [key]
+        if content_type in {"movie", "series", "anime"}:
+            sql += " AND content_type=?"
+            args.append(content_type)
+        sql += " ORDER BY " + EPISODE_ORDER + " LIMIT ?"
+        args.append(max(1, min(int(limit), 500)))
+        cur = await self.conn.execute(sql, tuple(args))
+        return await cur.fetchall()
+
+    async def recanonicalize_show_keys(self) -> int:
+        """Collapse old show keys ("taarak mehta", "tmkoc", "bigg boss 19") into one
+        canonical key, for catalog rows AND follows. Cheap: works per distinct key."""
+        changed = 0
+        cur = await self.conn.execute("SELECT DISTINCT show_key FROM movies WHERE show_key<>''")
+        for row in await cur.fetchall():
+            old = row["show_key"]
+            new = make_show_key(old)
+            if new and new != old:
+                await self.conn.execute("UPDATE movies SET show_key=? WHERE show_key=?", (new, old))
+                changed += 1
+        cur = await self.conn.execute("SELECT DISTINCT show_key FROM follows")
+        for row in await cur.fetchall():
+            old = row["show_key"]
+            new = make_show_key(old)
+            if new and new != old:
+                # keep one follow per (user, show): duplicates are dropped
+                await self.conn.execute("UPDATE OR IGNORE follows SET show_key=? WHERE show_key=?", (new, old))
+                await self.conn.execute("DELETE FROM follows WHERE show_key=?", (old,))
+                changed += 1
+        await self.conn.commit()
+        return changed
+
     async def backfill_show_keys(self, commit: bool = True) -> int:
         """Fill season/episode/show_key for rows restored from older backups."""
         cur = await self.conn.execute(
@@ -704,8 +742,8 @@ class DB:
 
     async def show_episodes(self, key: str, offset: int = 0, limit: int = 10) -> list[aiosqlite.Row]:
         cur = await self.conn.execute(
-            """SELECT * FROM movies WHERE storage_msg_id > 0 AND show_key=?
-               ORDER BY added_at DESC, season DESC, episode DESC, msg_id DESC LIMIT ? OFFSET ?""",
+            "SELECT * FROM movies WHERE storage_msg_id > 0 AND show_key=? ORDER BY "
+            + EPISODE_ORDER + " LIMIT ? OFFSET ?",
             (key, max(1, min(int(limit), 50)), max(0, int(offset))),
         )
         return await cur.fetchall()
@@ -720,7 +758,7 @@ class DB:
 
     async def latest_episode_id(self, key: str) -> int:
         cur = await self.conn.execute(
-            "SELECT msg_id FROM movies WHERE storage_msg_id > 0 AND show_key=? ORDER BY added_at DESC, msg_id DESC LIMIT 1",
+            "SELECT msg_id FROM movies WHERE storage_msg_id > 0 AND show_key=? ORDER BY " + EPISODE_ORDER + " LIMIT 1",
             (key,),
         )
         row = await cur.fetchone()
@@ -926,12 +964,14 @@ class DB:
         show = movie["show_key"] if "show_key" in keys else ""
         ep = int(movie["episode"] or 0) if "episode" in keys else 0
         air = (movie["air_date"] or "") if "air_date" in keys else ""
+        season = int(movie["season"] or 0) if "season" in keys else 0
         if show and (ep or air):
+            # same season too, so S01E01 is never replaced by S02E01
             cur = await self.conn.execute(
                 """SELECT * FROM movies WHERE storage_msg_id > 0 AND show_key=?
-                   AND ((? > 0 AND episode=?) OR (? <> '' AND air_date=?))
+                   AND ((? > 0 AND episode=? AND COALESCE(season,0)=?) OR (? <> '' AND air_date=?))
                    ORDER BY added_at DESC""",
-                (show, ep, ep, air, air),
+                (show, ep, ep, season, air, air),
             )
             for row in await cur.fetchall():
                 if int(row["storage_msg_id"] or row["msg_id"]) not in exclude:

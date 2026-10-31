@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from db import db
+from episode import display_name
 from keyboards import _short_date, button, episode_button_label, episode_text
 
 router = Router()
@@ -148,7 +149,7 @@ async def follow_toggle(cb: CallbackQuery):
         return await cb.answer("Ye show follow nahi ho sakta.", show_alert=True)
     if not await db.user(cb.from_user.id):
         await db.add_user(cb.from_user.id, cb.from_user.username or "", cb.from_user.full_name)
-    title = str(ref["title"] or "Show")
+    title = display_name(ref["show_key"], str(ref["title"] or "Show"))
     if await db.is_following(cb.from_user.id, ref["show_key"]):
         await db.unfollow(cb.from_user.id, ref["show_key"])
         await cb.answer(f"🔕 {title[:40]} unfollow ho gaya. Ab alert nahi aayega.", show_alert=True)
@@ -167,6 +168,26 @@ async def follow_toggle(cb: CallbackQuery):
             await _show(cb, view[0], view[1], edit=True)
 
 
+@router.callback_query(F.data.startswith("uf:"))
+async def unfollow_only(cb: CallbackQuery):
+    """Unfollow button on alerts: never toggles back to follow."""
+    try:
+        ref = await db.movie(int(cb.data.split(":")[1]))
+    except (IndexError, ValueError):
+        ref = None
+    if not ref or not ref["show_key"]:
+        return await cb.answer("Show nahi mila.", show_alert=True)
+    title = display_name(ref["show_key"], str(ref["title"] or "Show"))
+    removed = await db.unfollow(cb.from_user.id, ref["show_key"])
+    await cb.answer(f"🔕 {title[:40]} unfollow ho gaya." if removed else f"ℹ️ {title[:40]} pehle se unfollow hai.",
+                    show_alert=True)
+    try:
+        from snapshot import request_snapshot
+        await request_snapshot(cb.bot)
+    except Exception:
+        pass
+
+
 async def my_shows_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     rows = await db.follows(user_id)
     if not rows:
@@ -181,7 +202,7 @@ async def my_shows_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     for f in rows[:30]:
         latest = await db.latest_episode_id(f["show_key"])
         count = await db.show_episode_count(f["show_key"])
-        label = f"📺 {f['show_title'] or f['show_key']} ({count})"[:56]
+        label = f"📺 {display_name(f['show_key'], f['show_title'] or '')} ({count})"[:56]
         open_btn = button(label, callback_data=f"eps:{latest}:0" if latest else "myshows", style="success")
         keyboard.append([open_btn, button("🔕", callback_data=f"ufk:{f['id']}", style="danger")])
     keyboard.append([button("🏠 Home", callback_data="home")])

@@ -1,11 +1,12 @@
-"""Spelling correction for TV show / serial searches.
+"""Spelling correction + shortcuts for TV show / serial searches.
 
 Hindi serial names are typed in many romanised ways (Anupama / Anupamaa /
-Anupmaa, Yeh Rishta / Ye Rista, Kundali / Kundli Bhagya). Matching is done on a
-*phonetic key* (double letters collapsed, common transliteration swaps
-normalised, vowels softened) and only against the show-name part of each
-catalog title — the first few words — so long file captions like
-"Anupama Anupama'S Unexpected Shock Hs Dl Aac2 0 H 264" don't dilute the score.
+Anupmaa, Tarak Mehta ka oolta chsma, TMKOC, Big Boss). Order of checks:
+
+1. Known shortcut / alias (aliases.SHOW_ALIASES) — exact or prefix, also
+   phonetic ("tarak mehta ka oolta chsma" -> Taarak Mehta Ka Ooltah Chashmah).
+2. Fuzzy phonetic match against the alias table.
+3. Fuzzy phonetic match against the show-name part of every catalog title.
 """
 from __future__ import annotations
 
@@ -14,70 +15,16 @@ from typing import Optional
 
 from rapidfuzz import fuzz, process
 
+from aliases import (SHOW_ALIASES, WORD_FIXES, alias_target, all_alias_names, canonical_show,
+                     normalize as _normalize, phonetic)
 
-def _normalize(s: str) -> str:
-    s = re.sub(r"[^a-z0-9\s]", " ", (s or "").lower())
-    return re.sub(r"\s+", " ", s).strip()
+# Back-compat: old code/tests import COMMON_FIXES (normalised variant -> correct name).
+COMMON_FIXES: dict[str, str] = dict(WORD_FIXES)
+for _canon, _variants in SHOW_ALIASES.items():
+    for _v in _variants:
+        COMMON_FIXES.setdefault(_normalize(_v), _canon)
 
-
-# Common misspelling → correction map (normalised form → correct name)
-COMMON_FIXES = {
-    "mirjapur": "mirzapur",
-    "mirjapurr": "mirzapur",
-    "mirzapurr": "mirzapur",
-    "hanuman ansh": "hanumanansh",
-    "hanumanash": "hanumanansh",
-    "suryavanshi": "sooryavanshi",
-    "suryavansh": "sooryavanshi",
-    "brahmashtra": "brahmastra",
-    "brahmaastra": "brahmastra",
-    "ranjnaa": "ranjana",
-    "krissh": "krrish",
-    "krishh": "krrish",
-    "krisshh": "krrish",
-    "rajneeti": "raajneeti",
-    "donnd": "don",
-    "sholayy": "sholay",
-    "sholaay": "sholay",
-    # TV serials
-    "anupma": "anupamaa",
-    "anupmaa": "anupamaa",
-    "anupamma": "anupamaa",
-    "ye rishta": "yeh rishta kya kehlata hai",
-    "yrkkh": "yeh rishta kya kehlata hai",
-    "yeh rista": "yeh rishta kya kehlata hai",
-    "kundli bhagya": "kundali bhagya",
-    "kundli bhagy": "kundali bhagya",
-    "kumkum bhagy": "kumkum bhagya",
-    "kumkum bagya": "kumkum bhagya",
-    "tmkoc": "taarak mehta ka ooltah chashmah",
-    "tarak mehta": "taarak mehta ka ooltah chashmah",
-    "taarak mehta": "taarak mehta ka ooltah chashmah",
-    "gum hai kisi ke pyar me": "ghum hai kisikey pyaar meiin",
-    "ghkkpm": "ghum hai kisikey pyaar meiin",
-    "bhagya laxmi": "bhagya lakshmi",
-    "bhagyalaxmi": "bhagya lakshmi",
-    "big boss": "bigg boss",
-    "bigboss": "bigg boss",
-}
-
-# Applied in order on the normalised string.
-_PHONETIC_SWAPS = (
-    ("ksh", "x"), ("kh", "k"), ("gh", "g"), ("bh", "b"), ("dh", "d"), ("th", "t"),
-    ("ph", "f"), ("sh", "s"), ("ch", "c"), ("jh", "j"), ("z", "j"), ("w", "v"),
-    ("q", "k"), ("ck", "k"), ("ee", "i"), ("oo", "u"), ("ou", "u"), ("y", "i"),
-)
-
-
-def phonetic(s: str) -> str:
-    """Spelling-insensitive key: 'Anupamaa' == 'anupama' == 'anupmaa'-ish."""
-    s = _normalize(s)
-    for a, b in _PHONETIC_SWAPS:
-        s = s.replace(a, b)
-    s = re.sub(r"(.)\1+", r"\1", s)          # collapse doubled letters
-    s = re.sub(r"\bh\b|h(?=\s|$)", "", s)      # trailing silent h (yeh -> ye)
-    s = re.sub(r"a(?=\s|$)", "", s)            # trailing 'a'/'aa' (anupamaa -> anupam)
-    return re.sub(r"\s+", " ", s).strip()
+_ALIAS_PHON = {phonetic(name): name for name in all_alias_names() if len(phonetic(name)) >= 3}
 
 
 def _show_phrases(title: str, n_words: int) -> list[str]:
@@ -85,10 +32,37 @@ def _show_phrases(title: str, n_words: int) -> list[str]:
     if not words:
         return []
     out = []
-    for n in {max(1, n_words - 1), n_words, n_words + 1}:
+    for n in sorted({max(1, n_words - 1), n_words, n_words + 1}):
         if n <= len(words):
             out.append(" ".join(words[:n]))
     return out
+
+
+def alias_fix(query: str) -> Optional[str]:
+    """Canonical show for a shortcut / misspelt alias, else None."""
+    q_norm = _normalize(query)
+    if not q_norm or len(q_norm) < 2:
+        return None
+    if q_norm in WORD_FIXES:
+        return WORD_FIXES[q_norm]
+    canon = canonical_show(q_norm)
+    if canon:
+        return canon
+    if len(q_norm) < 4:
+        return None
+    q_key = phonetic(q_norm)
+    if not q_key:
+        return None
+    # Fuzzy against every alias phonetic key ("tarak mehta ka olta chsma").
+    hit = process.extractOne(q_key, list(_ALIAS_PHON), scorer=fuzz.ratio, score_cutoff=84)
+    if hit:
+        return alias_target(_ALIAS_PHON[hit[0]]) or None
+    # Half-typed name: "taarak meh" / "kundali bha"
+    if len(q_norm) >= 6:
+        for key, name in _ALIAS_PHON.items():
+            if key.startswith(q_key) and len(key) - len(q_key) <= 14:
+                return alias_target(name) or None
+    return None
 
 
 def correct_spelling(query: str, catalog_titles: Optional[list[str]] = None) -> Optional[str]:
@@ -96,8 +70,9 @@ def correct_spelling(query: str, catalog_titles: Optional[list[str]] = None) -> 
     q_norm = _normalize(query)
     if not q_norm or len(q_norm) < 3:
         return None
-    if q_norm in COMMON_FIXES:
-        return COMMON_FIXES[q_norm]
+    fixed = alias_fix(q_norm)
+    if fixed and fixed != q_norm:
+        return fixed
     if not catalog_titles:
         return None
 
@@ -123,25 +98,56 @@ def correct_spelling(query: str, catalog_titles: Optional[list[str]] = None) -> 
     return None
 
 
+_STOP = {"ka", "ki", "ke", "hai", "hain", "me", "mein", "the", "a", "of", "and", "se", "ko", "episode",
+         "full", "new", "today", "serial", "show", "season", "part"}
+
+
 def suggest_corrections(query: str, catalog_titles: Optional[list[str]] = None, limit: int = 3) -> list[str]:
-    """Up to `limit` distinct show names that look like the query."""
+    """Up to `limit` related show names that exist in the catalog.
+
+    Mixes phonetic look-alikes, alias hits and shows sharing a meaningful word
+    with the query, so "not found" always offers something related.
+    """
     q_norm = _normalize(query)
     if not q_norm or not catalog_titles:
         return []
     q_key = phonetic(q_norm)
     n_words = len(q_norm.split())
-    phrases = {}
+    phrases: dict[str, str] = {}
     for title in catalog_titles:
         for phrase in _show_phrases(title, n_words):
             phrases.setdefault(phonetic(phrase), phrase)
-    if not phrases:
-        return []
-    results = process.extract(q_key, list(phrases.keys()), scorer=fuzz.ratio, score_cutoff=70, limit=limit * 3)
     out: list[str] = []
-    for key, _score, _ in results:
-        name = phrases[key]
-        if name not in out and name != q_norm:
+
+    def add(name: str) -> None:
+        name = _normalize(name)
+        if name and name != q_norm and name not in out and len(out) < limit:
             out.append(name)
-        if len(out) >= limit:
-            break
+
+    # 1) alias -> only if that show is actually in the catalog
+    canon = alias_fix(q_norm)
+    if canon:
+        c_words = len(canon.split())
+        for title in catalog_titles:
+            if canonical_show(title) == canon or _normalize(title).startswith(canon):
+                add(canon if canonical_show(title) == canon else " ".join(_normalize(title).split()[:c_words]))
+                break
+    # 2) phonetic look-alikes
+    if phrases and q_key:
+        for key, _score, _ in process.extract(q_key, list(phrases), scorer=fuzz.ratio,
+                                              score_cutoff=66, limit=limit * 3):
+            add(phrases[key])
+    # 3) shows sharing a real word with the query ("mehta", "boss", "bhagya")
+    words = [w for w in q_norm.split() if len(w) >= 4 and w not in _STOP]
+    if words and len(out) < limit:
+        p_words = {phonetic(w) for w in words}
+        for title in catalog_titles:
+            t_words = _normalize(title).split()[:5]
+            if any(phonetic(w) in p_words for w in t_words):
+                add(" ".join(t_words[:4]))
+            if len(out) >= limit:
+                break
     return out
+
+
+__all__ = ["COMMON_FIXES", "phonetic", "alias_fix", "correct_spelling", "suggest_corrections"]

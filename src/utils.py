@@ -14,6 +14,7 @@ from config import (
     FIRST_DAY_FREE, DAILY_FREE, REFERRAL_REWARDS,
 )
 from db import db
+from aliases import canonical_show
 from episode import parse_episode
 
 QUALITY_PATTERNS = [
@@ -152,6 +153,15 @@ async def search_movies(query: str, limit: int = 20, content_type: str = "") -> 
     if not q_norm:
         return []
 
+    # Shortcut / alias ("tmkoc", "big boss", "tarak mehta ka oolta chsma"):
+    # every caption variant of the serial shares one show_key -> fetch by key.
+    canon = canonical_show(q_norm)
+    if canon:
+        wide = 200 if (wanted["episode"] or wanted["season"] or wanted["air_date"]) else max(limit, 40)
+        rows = await db.show_rows(canon, content_type=content_type, limit=wide)
+        if rows:
+            return _filter_episode(newest_first(rows), wanted)[:limit]
+
     # For large catalogs, use SQL LIKE pre-filter to avoid loading 1M+ rows.
     total_count = await db.movie_count(storage_only=True)
     if total_count > 5000:
@@ -227,9 +237,29 @@ def _row_value(row, key: str) -> int:
         return 0
 
 
+def _effective_day(row) -> int:
+    """Air date when it is believable, else the upload day (as an ordinal)."""
+    added = _row_value(row, "added_at")
+    added_day = datetime.date.fromtimestamp(added).toordinal() if added > 0 else 0
+    try:
+        air = row["air_date"] or ""
+    except (KeyError, IndexError):
+        air = ""
+    if air:
+        try:
+            air_day = datetime.date.fromisoformat(air).toordinal()
+            # captions sometimes carry a wrong/old date - only trust it near upload time
+            if not added_day or (added_day - 400) <= air_day <= (added_day + 2):
+                return air_day
+        except ValueError:
+            pass
+    return added_day
+
+
 def newest_first(rows: list) -> list:
-    """Latest uploaded episode/show on top (post date, then MAIN_DATA order)."""
-    return sorted(rows, key=lambda r: (_row_value(r, "added_at"), _row_value(r, "msg_id")), reverse=True)
+    """Latest episode on top: air date / upload day, then episode no., then upload time."""
+    return sorted(rows, key=lambda r: (_effective_day(r), _row_value(r, "episode"),
+                                       _row_value(r, "added_at"), _row_value(r, "msg_id")), reverse=True)
 
 
 # ---------------- quota ----------------
@@ -252,7 +282,9 @@ _QUOTA_LOCK_MAX = 5000
 
 def _quota_lock(user_id: int) -> asyncio.Lock:
     if len(_QUOTA_LOCKS) >= _QUOTA_LOCK_MAX:
-        _QUOTA_LOCKS.clear()
+        # Drop only idle locks - clearing a held lock let two deliveries take the same last slot.
+        for uid in [u for u, lock in _QUOTA_LOCKS.items() if not lock.locked()]:
+            _QUOTA_LOCKS.pop(uid, None)
     return _QUOTA_LOCKS.setdefault(int(user_id), asyncio.Lock())
 
 

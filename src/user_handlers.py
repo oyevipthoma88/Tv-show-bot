@@ -35,7 +35,7 @@ from indexer import classify, index_message
 from snapshot import request_snapshot
 from movie_catalog import catalog_label
 from channel_search import search_channel
-from spelling import correct_spelling, suggest_corrections
+from spelling import alias_fix, correct_spelling, suggest_corrections
 from utils import (get_movie_channel, apply_referral_rewards, check_quota,
                    human_left, is_first_calendar_day, is_premium, post_link, search_movies,
                    transcribe_voice, user_tag, reserve_quota, refund_quota)
@@ -43,7 +43,7 @@ from utils import (get_movie_channel, apply_referral_rewards, check_quota,
 router = Router()
 
 from db import DEFAULT_CAPTION_TEMPLATE  # noqa: E402  (TV show caption)
-from episode import pretty_date  # noqa: E402
+from episode import display_name, pretty_date  # noqa: E402
 from keyboards import _short_date, episode_text  # noqa: E402
 from show_handlers import follow_rows  # noqa: E402
 
@@ -596,12 +596,14 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
     if not results:
         # Strong spelling fix: "anupma" / "kundli bhagy" -> real show name, then retry.
         try:
-            vocab = await db.distinct_show_titles()
-            fixed = correct_spelling(query, vocab)
-            if fixed and fixed.lower() != query.lower():
+            tried = {query.lower().strip()}
+            fixed = alias_fix(query)
+            if not fixed or fixed.lower() in tried:
+                fixed = correct_spelling(query, await db.distinct_show_titles())
+            if fixed and fixed.lower() not in tried:
                 results = await search_movies(fixed, content_type=content_type)
                 if results:
-                    autocorrected = fixed
+                    autocorrected = fixed.title()
         except Exception as exc:
             logging.warning("Spelling auto-correct failed for %r: %s", query, exc)
 
@@ -654,13 +656,18 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
         
         candidate_titles = await db.distinct_show_titles()
         corrected = correct_spelling(query, candidate_titles) or ""
-        guesses = suggest_corrections(query, candidate_titles, limit=3)
+        guesses = suggest_corrections(query, candidate_titles, limit=4)
         spelling_msg = ""
         if guesses:
             spelling_msg = "\n\n💡 Kya aap inme se koi dhundh rahe the? Tap karo 👇"
+        else:
+            # Nothing similar: offer the shows that are hot right now.
+            guesses = [g for g in await db.latest_show_titles(4) if g]
+            if guesses:
+                spelling_msg = "\n\n🔥 <b>Abhi trending shows</b> — tap karke dekho 👇"
         kb_rows = []
-        for g in guesses:
-            kb_rows.append([button(f"🔎 {g.title()}"[:56], callback_data=f"sq:{g[:50]}", style="primary")])
+        for g in guesses[:4]:
+            kb_rows.append([button(f"🔎 {display_name(g, g).title()}"[:56], callback_data=_sq_data(g), style="primary")])
         if suggestion_markup:
             kb_rows.extend(suggestion_markup.inline_keyboard)
         if support_url:
@@ -701,7 +708,7 @@ async def do_search(message: Message, query: str, state: FSMContext, bot: Bot | 
             continue
         seen_keys.add(key)
         is_f = await db.is_following(message.from_user.id, key)
-        name = str(row["title"] or "Show").split("  ")[0][:28]
+        name = display_name(key, str(row["title"] or "Show").split("  ")[0])[:28]
         extra.append([button(f"{'🔕 Unfollow' if is_f else '🔔 Follow'} • {name}",
                              callback_data=f"fl:{row['msg_id']}", style="danger" if is_f else "success")])
         if len(seen_keys) >= 4:
@@ -1004,6 +1011,16 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
             timeout=20,
         )
         copied_id = getattr(copied, "message_id", 0)
+    except Exception as exc:
+        await refund_quota(cb.from_user.id)
+        logging.exception("Direct download failed for %s: %s", msg_id, exc)
+        await cb.message.answer(
+            "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
+            "aapka free count wapas kar diya gaya hai.</blockquote>"
+        )
+        return
+    # File already delivered: bookkeeping errors must not refund or say "failed".
+    try:
         if copied_id and 1 <= delete_minutes <= 1440:
             await db.schedule_expiry(
                 cb.from_user.id,
@@ -1012,12 +1029,12 @@ async def direct_download(cb: CallbackQuery, bot: Bot, state: FSMContext):
             )
         await db.add_history(cb.from_user.id, "", "Direct channel", msg_id)
     except Exception as exc:
-        await refund_quota(cb.from_user.id)
-        logging.exception("Direct download failed for %s: %s", msg_id, exc)
-        await cb.message.answer(
-            "<blockquote>⚠️ Episode abhi deliver nahi ho payi. Thodi der me dobara tap karo — "
-            "aapka free count wapas kar diya gaya hai.</blockquote>"
-        )
+        logging.warning("Direct delivery bookkeeping failed for %s: %s", msg_id, exc)
+
+
+def _sq_data(text: str) -> str:
+    """'sq:<query>' trimmed to Telegram's 64-BYTE callback limit (Hindi text is 3 bytes/char)."""
+    return "sq:" + str(text).encode("utf-8")[:61].decode("utf-8", errors="ignore").strip()
 
 
 @router.callback_query(F.data.startswith("sq:"))

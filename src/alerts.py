@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup
 
 from db import db
+from episode import display_name
 from keyboards import button, episode_button_label, episode_text
 
 log = logging.getLogger("alerts")
@@ -44,14 +45,19 @@ async def queue_new_episode(bot, msg_id: int) -> None:
 
 
 async def _flush_later(bot) -> None:
-    await asyncio.sleep(BATCH_DELAY_SECONDS)
-    batch = dict(_pending)
-    _pending.clear()
-    for key, ids in batch.items():
-        try:
-            await _send_show_alert(bot, key, ids)
-        except Exception:
-            log.exception("Episode alert failed for show %s", key)
+    # Keep draining: uploads that arrive while a batch is being sent are
+    # picked up by the next loop instead of being stranded in _pending.
+    while True:
+        await asyncio.sleep(BATCH_DELAY_SECONDS)
+        if not _pending:
+            return
+        batch = dict(_pending)
+        _pending.clear()
+        for key, ids in batch.items():
+            try:
+                await _send_show_alert(bot, key, ids)
+            except Exception:
+                log.exception("Episode alert failed for show %s", key)
 
 
 def _alert_markup(rows: list) -> InlineKeyboardMarkup:
@@ -61,14 +67,15 @@ def _alert_markup(rows: list) -> InlineKeyboardMarkup:
     newest = rows[0]["msg_id"]
     keyboard.append([
         button("📂 All Episodes", callback_data=f"eps:{newest}:0"),
-        button("🔕 Unfollow", callback_data=f"fl:{newest}", style="danger"),
+        # uf: = always unfollow (an old alert must never re-follow the show)
+        button("🔕 Unfollow", callback_data=f"uf:{newest}", style="danger"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def alert_text(rows: list) -> str:
     top = rows[0]
-    title = escape(str(top["title"] or "Show"))
+    title = escape(display_name(top["show_key"] or "", str(top["title"] or "Show")))
     if len(rows) == 1:
         ep = episode_text(top)
         details = " • ".join(x for x in [
@@ -92,7 +99,8 @@ async def _send_show_alert(bot, key: str, ids: list[int]) -> None:
     rows = [r for r in [await db.movie(i) for i in ids] if r]
     if not rows:
         return
-    rows.sort(key=lambda r: (int(r["added_at"] or 0), int(r["msg_id"])), reverse=True)
+    from utils import newest_first
+    rows = newest_first(rows)
     followers = await db.followers(key)
     if not followers:
         return
